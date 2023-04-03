@@ -49,4 +49,5 @@ convert x: -resize 300% -set density 300 \
 +dither  -colors 2  -normalize \
 $debug png:- | \
 tesseract --dpi 300 --psm 6 stdin stdout
+https://docs.rs/chinese_dictionary/latest/chinese_dictionary/
 */
