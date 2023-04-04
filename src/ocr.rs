@@ -1,5 +1,4 @@
 use core::fmt;
-use std::result;
 
 use clipboard::{ClipboardContext, ClipboardProvider};
 use leptess::LepTess;
