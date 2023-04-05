@@ -1,8 +1,11 @@
+use std::fs;
+
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{WindowBuilder, Window},
 };
+use screenshots::Screen;
 
 struct State {
     surface: wgpu::Surface,
@@ -31,18 +34,6 @@ impl State {
         // State owns the window so this should be safe.
         let surface = unsafe { instance.create_surface(&window) }.unwrap();
 
-        let adapter = instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ).await.unwrap();
-
-        for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
-            println!("{:?}", adapter);
-        }
-
         let adapter = instance
         .enumerate_adapters(wgpu::Backends::all())
         .filter(|adapter| {
@@ -68,6 +59,7 @@ impl State {
         ).await.unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
+
         // Shader code in this tutorial assumes an sRGB surface texture. Using a different
         // one will result all the colors coming out darker. If you want to support non
         // sRGB surfaces, you'll need to account for that when drawing to the frame.
@@ -76,10 +68,8 @@ impl State {
             .filter(|f| f.describe().srgb)
             .next()
             .unwrap_or(surface_caps.formats[0]);
-        println!("Surface caps formats {:?}", surface_caps.formats);
-        println!("Surface caps alpha modes {:?}", surface_caps.alpha_modes);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -117,7 +107,16 @@ impl State {
     }
 
     fn update(&mut self) {
-        // todo!()
+        let window_inner_position = self.window.inner_position().unwrap();
+        println!("Window Position: {:?}", window_inner_position);
+        let window_size = self.window.inner_size();
+        println!("Window Size: {:?}", window_size);
+        let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
+        println!("Screen: {:?}", screen);
+        let display_position = screen.display_info;
+        let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
+        let buffer = image.buffer();
+        fs::write("target/capture.png", buffer).unwrap();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -155,7 +154,6 @@ impl State {
     }
     
 }
-
 
 pub async fn screen_entry() {
     env_logger::init();
