@@ -2,5 +2,5 @@ mod ocr;
 mod screen_access;
 
 fn main() {
-    screen_access::screen_entry();
+    pollster::block_on(screen_access::screen_entry());
 }
