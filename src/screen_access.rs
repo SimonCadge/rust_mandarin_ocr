@@ -116,7 +116,7 @@ impl State {
         let display_position = screen.display_info;
         let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
         let buffer = image.buffer();
-        fs::write("target/capture.png", buffer).unwrap();
+        fs::write("capture.png", buffer).unwrap();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
