@@ -1,11 +1,15 @@
-use std::fs;
+use std::{time::Instant, io};
 
+use pollster::block_on;
+use tokio::{task, runtime::{Runtime, self}};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{WindowBuilder, Window},
 };
 use screenshots::Screen;
+
+use crate::ocr;
 
 struct State {
     surface: wgpu::Surface,
@@ -14,6 +18,9 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: Window,
+    tokio_runtime: Runtime,
+    ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
+    ocr_text: Option<String>,
 }
 
 impl State {
@@ -86,6 +93,13 @@ impl State {
             queue,
             config,
             size,
+            tokio_runtime: runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("ocr_worker")
+                .build()
+                .unwrap(),
+            ocr_job: None,
+            ocr_text: None,
         }
     }
 
@@ -107,16 +121,32 @@ impl State {
     }
 
     fn update(&mut self) {
-        let window_inner_position = self.window.inner_position().unwrap();
-        println!("Window Position: {:?}", window_inner_position);
+        if let Some(running_job) = &self.ocr_job {
+            running_job.abort();
+            self.ocr_job = None;
+        }
         let window_size = self.window.inner_size();
-        println!("Window Size: {:?}", window_size);
-        let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
-        println!("Screen: {:?}", screen);
-        let display_position = screen.display_info;
-        let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
-        let buffer = image.buffer();
-        fs::write("capture.png", buffer).unwrap();
+        let window_inner_position = self.window.inner_position().unwrap();
+        self.ocr_job = Some(self.tokio_runtime.spawn(async move {
+            let start_time = Instant::now();
+            let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
+            let display_position = screen.display_info;
+            let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
+            let buffer = image.buffer();
+            println!("Screenshot took {} ms", start_time.elapsed().as_millis());
+            return Ok(ocr::execute_ocr(buffer));
+        }));
+    }
+
+    fn check_running_job(&mut self) {
+        if self.ocr_job.is_some() {
+            let running_job = self.ocr_job.as_mut().unwrap();
+            if running_job.is_finished() {
+                let ocr_text = block_on(running_job).unwrap().unwrap();
+                self.ocr_job = None;
+                self.ocr_text = Some(ocr_text);
+            }
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -185,6 +215,9 @@ pub async fn screen_entry() {
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                         state.resize(**new_inner_size);
                     }
+                    WindowEvent::Moved(_) => {
+                        state.window().request_redraw();
+                    }
                     _ => {}
                 }
             }
@@ -203,7 +236,8 @@ pub async fn screen_entry() {
             Event::MainEventsCleared => {
                 // RedrawRequested will only trigger once, unless we manually
                 // request it.
-                state.window().request_redraw();
+                state.check_running_job();
+                // state.window().request_redraw();
             }
             _ => {}
         }
