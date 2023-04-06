@@ -1,5 +1,6 @@
 use std::{time::Instant, io};
 
+use html_parser::{Dom, Node};
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
 use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, Section, Text};
@@ -23,7 +24,7 @@ struct State {
     glyph_brush: GlyphBrush<()>,
     tokio_runtime: Runtime,
     ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
-    ocr_text: Option<String>,
+    ocr_text: Option<html_parser::Dom>,
 }
 
 impl State {
@@ -158,7 +159,7 @@ impl State {
             if running_job.is_finished() {
                 let ocr_text = block_on(running_job).unwrap().unwrap();
                 self.ocr_job = None;
-                self.ocr_text = Some(ocr_text);
+                self.ocr_text = Some(html_parser::Dom::parse(&ocr_text).unwrap());
                 self.render().unwrap();
             }
         }
@@ -191,15 +192,18 @@ impl State {
             });
         }
 
-        if let Some(text) = &self.ocr_text {
-            self.glyph_brush.queue(Section {
-                screen_position: (0.0, 0.0),
-                bounds: (self.size.width as f32, self.size.height as f32),
-                text: vec![Text::new(&text)
-                    .with_color([1.0, 1.0, 1.0, 1.0])
-                    .with_scale(10.0)],
-                ..Section::default()
-            });
+        if let Some(dom) = &self.ocr_text {
+            let words = nodes_to_words(&dom.children);
+            for word in words {
+                self.glyph_brush.queue(Section {
+                    screen_position: (word.1, word.2),
+                    bounds: (word.3, word.4),
+                    text: vec![Text::new(&word.0)
+                        .with_color([1.0, 1.0, 1.0, 1.0])
+                        .with_scale(10.0)],
+                    ..Section::default()
+                });
+            }
 
             self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.size.width, self.size.height).unwrap();
         }
@@ -214,6 +218,29 @@ impl State {
         Ok(())
     }
     
+}
+
+fn nodes_to_words(nodes: &Vec<Node>) -> Vec<(String, f32, f32, f32, f32)> {
+    let mut words: Vec<(String, f32, f32, f32, f32)> = Vec::new();
+    for node in nodes {
+        if let html_parser::Node::Element(element) = node {
+            if element.classes.contains(&"ocrx_word".to_string()) { // is individual word
+                let title = element.attributes["title"].clone().unwrap();
+                println!("{}", title);
+                let mut parts = title.split(" ");
+                parts.next();
+                let x = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
+                let y = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
+                let width = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap() - x;
+                let height = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap() - y;
+                let text_node = element.children[0].text().unwrap().to_string();
+                words.push((text_node, x, y, width, height));
+            } else {
+                words.append(&mut nodes_to_words(&node.element().unwrap().children));
+            }
+        }
+    }
+    return words;
 }
 
 pub async fn screen_entry() {

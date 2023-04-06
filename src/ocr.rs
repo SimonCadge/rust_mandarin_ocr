@@ -61,28 +61,40 @@ pub fn execute_ocr(image: &Vec<u8>) -> String {
 
     let final_ocr = leptess.get_utf8_text().unwrap();
 
+    // let boxes = leptess.get_component_boxes(leptess::capi::TessPageIteratorLevel_RIL_WORD, true).unwrap();
+    // for b in &boxes {
+    //     println!("{:?}", b);
+    // }
+
+    let hocr_text = leptess.get_hocr_text(0).unwrap();
+
     println!("OCR took {} ms", start_time.elapsed().as_millis());
     
     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
     ctx.set_contents(final_ocr.clone()).unwrap();
 
-    match language {
-        SupportedLanguages::ChiTra => {
-            let stripped_ocr = remove_whitespace(&final_ocr); //Remove all Whitespace
-            let tokenized_text = tokenize(&stripped_ocr);
-            println!("{} tokens", tokenized_text.len());
-            for token in tokenized_text {
-                let results = query(token).unwrap();
-                for result in results {
-                    println!("{} - {:?}", token, result.english);
-                }
-            }
-            return stripped_ocr;
-        }
-        _ => {
-            let stripped_ocr = final_ocr.trim();
-            return stripped_ocr.to_owned();
-        }
-    }
+    return hocr_text;
+
+    // match language {
+    //     SupportedLanguages::ChiTra => {
+    //         let stripped_ocr = remove_whitespace(&final_ocr); //Remove all Whitespace
+    //         let tokenized_text = tokenize(&stripped_ocr);
+    //         println!("{} tokens", tokenized_text.len());
+    //         for token in tokenized_text {
+    //             let results = query(token).unwrap();
+    //             for result in results {
+    //                 println!("{} - {:?}", token, result.english);
+    //             }
+    //         }
+    //         return stripped_ocr;
+    //     }
+    //     _ => {
+    //         let stripped_ocr = final_ocr.trim();
+    //         return stripped_ocr.to_owned();
+    //     }
+    // }
 
 }
+
+// https://www.warp.dev/blog/how-to-draw-styled-rectangles-using-the-gpu-and-metal
+// Figure out how to draw the boxes to the screen
