@@ -2,6 +2,7 @@ use std::{time::Instant, io};
 
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
+use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, Section, Text};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -15,9 +16,11 @@ struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    staging_belt: wgpu::util::StagingBelt,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: Window,
+    glyph_brush: GlyphBrush<()>,
     tokio_runtime: Runtime,
     ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
     ocr_text: Option<String>,
@@ -86,13 +89,23 @@ impl State {
         };
         surface.configure(&device, &config);
 
+        // Prepare glyph_brush
+        let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
+            "Inconsolata-Regular.ttf"
+        )).unwrap();
+
+        let mut glyph_brush = GlyphBrushBuilder::using_font(inconsolata)
+            .build(&device, surface_format);
+
         Self {
             window,
             surface,
             device,
             queue,
+            staging_belt: wgpu::util::StagingBelt::new(1024),
             config,
             size,
+            glyph_brush,
             tokio_runtime: runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .thread_name("ocr_worker")
@@ -124,6 +137,7 @@ impl State {
         if let Some(running_job) = &self.ocr_job {
             running_job.abort();
             self.ocr_job = None;
+            self.ocr_text = None;
         }
         let window_size = self.window.inner_size();
         let window_inner_position = self.window.inner_position().unwrap();
@@ -145,6 +159,7 @@ impl State {
                 let ocr_text = block_on(running_job).unwrap().unwrap();
                 self.ocr_job = None;
                 self.ocr_text = Some(ocr_text);
+                self.render().unwrap();
             }
         }
     }
@@ -175,10 +190,26 @@ impl State {
                 depth_stencil_attachment: None,
             });
         }
+
+        if let Some(text) = &self.ocr_text {
+            self.glyph_brush.queue(Section {
+                screen_position: (0.0, 0.0),
+                bounds: (self.size.width as f32, self.size.height as f32),
+                text: vec![Text::new(&text)
+                    .with_color([1.0, 1.0, 1.0, 1.0])
+                    .with_scale(10.0)],
+                ..Section::default()
+            });
+
+            self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.size.width, self.size.height).unwrap();
+        }
     
+        self.staging_belt.finish();
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        self.staging_belt.recall();
     
         Ok(())
     }
