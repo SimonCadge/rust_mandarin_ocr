@@ -39,7 +39,7 @@ pub fn execute_ocr(image: &Vec<u8>) -> String {
     initialize();
     let language = SupportedLanguages::Eng;
     let mut leptess = LepTess::new(None, &language.to_string()).unwrap();
-    leptess.set_variable(leptess::Variable::TesseditPagesegMode, "6").unwrap();
+    leptess.set_variable(leptess::Variable::TesseditPagesegMode, "12").unwrap();
     
     let mut wand = MagickWand::new();
     

@@ -7,7 +7,7 @@ use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, Section, Text};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::{WindowBuilder, Window},
+    window::{WindowBuilder, Window}, dpi::PhysicalPosition,
 };
 use screenshots::Screen;
 
@@ -24,7 +24,25 @@ struct State {
     glyph_brush: GlyphBrush<()>,
     tokio_runtime: Runtime,
     ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
-    ocr_text: Option<html_parser::Dom>,
+    ocr_text: Option<Vec<BboxWord>>,
+}
+
+struct BboxWord {
+    text: String,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    is_highlighted: bool,
+}
+
+impl BboxWord {
+    fn is_within_bounds(&mut self, position: &PhysicalPosition<f64>) -> bool {
+        let cursor_x: f32 = position.x as f32;
+        let cursor_y: f32 = position.y as f32;
+        return cursor_x > self.x && cursor_x <= (self.x + self.width)
+            && cursor_y > self.y && cursor_y <= (self.y + self.height);
+    }
 }
 
 impl State {
@@ -158,8 +176,9 @@ impl State {
             let running_job = self.ocr_job.as_mut().unwrap();
             if running_job.is_finished() {
                 let ocr_text = block_on(running_job).unwrap().unwrap();
+                println!("{}", ocr_text);
                 self.ocr_job = None;
-                self.ocr_text = Some(html_parser::Dom::parse(&ocr_text).unwrap());
+                self.ocr_text = Some(nodes_to_words(&html_parser::Dom::parse(&ocr_text).unwrap().children));
                 self.render().unwrap();
             }
         }
@@ -192,15 +211,14 @@ impl State {
             });
         }
 
-        if let Some(dom) = &self.ocr_text {
-            let words = nodes_to_words(&dom.children);
+        if let Some(words) = &self.ocr_text {
             for word in words {
                 self.glyph_brush.queue(Section {
-                    screen_position: (word.1, word.2),
-                    bounds: (word.3, word.4),
-                    text: vec![Text::new(&word.0)
-                        .with_color([1.0, 1.0, 1.0, 1.0])
-                        .with_scale(10.0)],
+                    screen_position: (word.x, word.y),
+                    bounds: (word.width, word.height),
+                    text: vec![Text::new(&word.text)
+                        .with_color(if word.is_highlighted { [1.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] })
+                        .with_scale(word.height)],
                     ..Section::default()
                 });
             }
@@ -217,24 +235,54 @@ impl State {
     
         Ok(())
     }
+
+    fn handle_cursor(&mut self, cursor_position: &PhysicalPosition<f64>) {
+        if let Some(bbox_words) = &mut self.ocr_text {
+            for bbox_word in bbox_words {
+                if bbox_word.is_within_bounds(cursor_position) {
+                    bbox_word.is_highlighted = true;
+                } else {
+                    bbox_word.is_highlighted = false;
+                }
+            }
+            self.render().unwrap();
+        }
+    }
+
+    fn handle_click(&self) {
+        if let Some(bbox_words) = &self.ocr_text {
+            for bbox_word in bbox_words {
+                if bbox_word.is_highlighted {
+                    println!("{}", bbox_word.text);
+                }
+            }
+        }
+    }
     
 }
 
-fn nodes_to_words(nodes: &Vec<Node>) -> Vec<(String, f32, f32, f32, f32)> {
-    let mut words: Vec<(String, f32, f32, f32, f32)> = Vec::new();
+fn nodes_to_words(nodes: &Vec<Node>) -> Vec<BboxWord> {
+    let mut words: Vec<BboxWord> = Vec::new();
     for node in nodes {
         if let html_parser::Node::Element(element) = node {
             if element.classes.contains(&"ocrx_word".to_string()) { // is individual word
                 let title = element.attributes["title"].clone().unwrap();
-                println!("{}", title);
                 let mut parts = title.split(" ");
                 parts.next();
-                let x = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
-                let y = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
-                let width = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap() - x;
-                let height = parts.next().unwrap().chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap() - y;
-                let text_node = element.children[0].text().unwrap().to_string();
-                words.push((text_node, x, y, width, height));
+                let x = parse_bbox_f32(parts.next().unwrap());
+                let y = parse_bbox_f32(parts.next().unwrap());
+                let width = parse_bbox_f32(parts.next().unwrap()) - x;
+                let height = parse_bbox_f32(parts.next().unwrap()) - y;
+                let text = get_text_child(&element.children);
+                let word = BboxWord {
+                    text,
+                    x,
+                    y,
+                    width,
+                    height,
+                    is_highlighted: false
+                };
+                words.push(word);
             } else {
                 words.append(&mut nodes_to_words(&node.element().unwrap().children));
             }
@@ -243,19 +291,35 @@ fn nodes_to_words(nodes: &Vec<Node>) -> Vec<(String, f32, f32, f32, f32)> {
     return words;
 }
 
+fn get_text_child(nodes: &Vec<Node>) -> String {
+    for node in nodes {
+        if let html_parser::Node::Text(text) = node {
+            return text.to_string();
+        } else if let html_parser::Node::Element(element) = node {
+            return get_text_child(&element.children);
+        }
+    }
+    return "".to_string();
+}
+
+fn parse_bbox_f32(string: &str) -> f32 {
+    let parsed = string.chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
+    return parsed / 5.0; //OCR image was upscaled 5x before processing
+}
+
 pub async fn screen_entry() {
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().with_transparent(true).build(&event_loop).unwrap();
 
-    let mut state = State::new(window).await;
+    let mut window_state = State::new(window).await;
 
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
                 ref event,
                 window_id,
-            } if window_id == state.window().id() => if !state.input(event) {
+            } if window_id == window_state.window().id() => if !window_state.input(event) {
                 match event {
                     WindowEvent::CloseRequested
                     | WindowEvent::KeyboardInput {
@@ -268,23 +332,31 @@ pub async fn screen_entry() {
                         ..
                     } => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
+                        window_state.resize(*physical_size);
                     }
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(**new_inner_size);
+                        window_state.resize(**new_inner_size);
                     }
                     WindowEvent::Moved(_) => {
-                        state.window().request_redraw();
+                        window_state.window().request_redraw();
+                    }
+                    WindowEvent::CursorMoved { device_id: _, position, modifiers: _ } => {
+                        window_state.handle_cursor(position);
+                    }
+                    WindowEvent::MouseInput { device_id: _, state, button: _, modifiers: _ } => {
+                        if let ElementState::Released = state {
+                            window_state.handle_click();
+                        }
                     }
                     _ => {}
                 }
             }
-            Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-                state.update();
-                match state.render() {
+            Event::RedrawRequested(window_id) if window_id == window_state.window().id() => {
+                window_state.update();
+                match window_state.render() {
                     Ok(_) => {}
                     // Reconfigure the surface if lost
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::Lost) => window_state.resize(window_state.size),
                     // The system is out of memory, we should probably quit
                     Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
                     // All other errors (Outdated, Timeout) should be resolved by the next frame
@@ -294,7 +366,7 @@ pub async fn screen_entry() {
             Event::MainEventsCleared => {
                 // RedrawRequested will only trigger once, unless we manually
                 // request it.
-                state.check_running_job();
+                window_state.check_running_job();
                 // state.window().request_redraw();
             }
             _ => {}
