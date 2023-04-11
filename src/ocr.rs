@@ -1,10 +1,7 @@
 use core::fmt;
-use std::time::Instant;
 
-use clipboard::{ClipboardContext, ClipboardProvider};
-use leptess::LepTess;
 use graphicsmagick::{initialize, types::{FilterTypes}, wand::MagickWand};
-use chinese_dictionary::{tokenize, query};
+use tesseract::{Tesseract, PageSegMode};
 
 #[derive(PartialEq)]
 enum SupportedLanguages {
@@ -21,10 +18,6 @@ impl fmt::Display for SupportedLanguages {
     }
 }
 
-fn remove_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<String>()
-}
-
 /* 
 語言來看我用注音
 convert x: -resize 300% -set density 300 \
@@ -35,11 +28,8 @@ https://docs.rs/chinese_dictionary/latest/chinese_dictionary/
 */
 
 pub fn execute_ocr(image: &Vec<u8>) -> String {
-    let mut start_time = Instant::now();
     initialize();
-    let language = SupportedLanguages::Eng;
-    let mut leptess = LepTess::new(None, &language.to_string()).unwrap();
-    leptess.set_variable(leptess::Variable::TesseditPagesegMode, "12").unwrap();
+    let language = SupportedLanguages::ChiTra;
     
     let mut wand = MagickWand::new();
     
@@ -50,51 +40,16 @@ pub fn execute_ocr(image: &Vec<u8>) -> String {
         .normalize_image().unwrap();
 
     wand.set_image_format("PNG").unwrap();
+    //TODO: Set dpi
+    //TODO: Ensure that background is white and text is black
+    //TODO: Remove alpha channel
+    // https://github.com/tesseract-ocr/tessdoc/blob/main/ImproveQuality.md#inverting-images
 
-    println!("Processing image took {} ms", start_time.elapsed().as_millis());
-
-    start_time = Instant::now();
-
-    leptess.set_image_from_mem(&wand.write_image_blob().unwrap()).unwrap();
-
-    println!("Pass image to leptess took {} ms", start_time.elapsed().as_millis());
-
-    let final_ocr = leptess.get_utf8_text().unwrap();
-
-    // let boxes = leptess.get_component_boxes(leptess::capi::TessPageIteratorLevel_RIL_WORD, true).unwrap();
-    // for b in &boxes {
-    //     println!("{:?}", b);
-    // }
-
-    let hocr_text = leptess.get_hocr_text(0).unwrap();
-
-    println!("OCR took {} ms", start_time.elapsed().as_millis());
-    
-    let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-    ctx.set_contents(final_ocr.clone()).unwrap();
-
-    return hocr_text;
-
-    // match language {
-    //     SupportedLanguages::ChiTra => {
-    //         let stripped_ocr = remove_whitespace(&final_ocr); //Remove all Whitespace
-    //         let tokenized_text = tokenize(&stripped_ocr);
-    //         println!("{} tokens", tokenized_text.len());
-    //         for token in tokenized_text {
-    //             let results = query(token).unwrap();
-    //             for result in results {
-    //                 println!("{} - {:?}", token, result.english);
-    //             }
-    //         }
-    //         return stripped_ocr;
-    //     }
-    //     _ => {
-    //         let stripped_ocr = final_ocr.trim();
-    //         return stripped_ocr.to_owned();
-    //     }
-    // }
+    let mut tesseract = Tesseract::new_with_oem(None, Some(&language.to_string()), 
+        tesseract::OcrEngineMode::TesseractLstmCombined).unwrap();
+    tesseract.set_page_seg_mode(PageSegMode::PsmSingleBlock);
+    return tesseract.set_image_from_mem(&wand.write_image_blob().unwrap()).unwrap()
+        .recognize().unwrap()
+        .get_hocr_text(0).unwrap();
 
 }
-
-// https://www.warp.dev/blog/how-to-draw-styled-rectangles-using-the-gpu-and-metal
-// Figure out how to draw the boxes to the screen

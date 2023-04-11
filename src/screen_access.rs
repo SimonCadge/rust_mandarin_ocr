@@ -1,6 +1,6 @@
 use std::{time::Instant, io};
 
-use html_parser::{Dom, Node};
+use html_parser::{Node};
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
 use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, Section, Text};
@@ -110,10 +110,10 @@ impl State {
 
         // Prepare glyph_brush
         let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
-            "Inconsolata-Regular.ttf"
+            "SimHei.ttf"
         )).unwrap();
 
-        let mut glyph_brush = GlyphBrushBuilder::using_font(inconsolata)
+        let glyph_brush = GlyphBrushBuilder::using_font(inconsolata)
             .build(&device, surface_format);
 
         Self {
@@ -148,7 +148,7 @@ impl State {
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
+    fn input(&mut self, _event: &WindowEvent) -> bool {
         false
     }
 
@@ -175,10 +175,10 @@ impl State {
         if self.ocr_job.is_some() {
             let running_job = self.ocr_job.as_mut().unwrap();
             if running_job.is_finished() {
-                let ocr_text = block_on(running_job).unwrap().unwrap();
-                println!("{}", ocr_text);
+                let hocr = block_on(running_job).unwrap().unwrap();
+                println!("{}", hocr);
                 self.ocr_job = None;
-                self.ocr_text = Some(nodes_to_words(&html_parser::Dom::parse(&ocr_text).unwrap().children));
+                self.ocr_text = Some(nodes_to_words(&html_parser::Dom::parse(&hocr).unwrap().children));
                 self.render().unwrap();
             }
         }
@@ -215,7 +215,7 @@ impl State {
             for word in words {
                 self.glyph_brush.queue(Section {
                     screen_position: (word.x, word.y),
-                    bounds: (word.width, word.height),
+                    // bounds: (word.width, word.height),
                     text: vec![Text::new(&word.text)
                         .with_color(if word.is_highlighted { [1.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] })
                         .with_scale(word.height)],
@@ -253,7 +253,7 @@ impl State {
         if let Some(bbox_words) = &self.ocr_text {
             for bbox_word in bbox_words {
                 if bbox_word.is_highlighted {
-                    println!("{}", bbox_word.text);
+                    println!("{} - {},{}", bbox_word.text, bbox_word.x, bbox_word.y);
                 }
             }
         }
@@ -283,7 +283,7 @@ fn nodes_to_words(nodes: &Vec<Node>) -> Vec<BboxWord> {
                     is_highlighted: false
                 };
                 words.push(word);
-            } else {
+            } else { // call recursively until we reach individual words
                 words.append(&mut nodes_to_words(&node.element().unwrap().children));
             }
         }
@@ -291,10 +291,12 @@ fn nodes_to_words(nodes: &Vec<Node>) -> Vec<BboxWord> {
     return words;
 }
 
+
+
 fn get_text_child(nodes: &Vec<Node>) -> String {
     for node in nodes {
         if let html_parser::Node::Text(text) = node {
-            return text.to_string();
+            return text.to_string().trim().to_owned();
         } else if let html_parser::Node::Element(element) = node {
             return get_text_child(&element.children);
         }
