@@ -1,19 +1,21 @@
 use core::fmt;
 
-use graphicsmagick::{initialize, types::{FilterTypes}, wand::MagickWand};
+use graphicsmagick::{initialize, types::{FilterTypes}, wand::{MagickWand, PixelWand}};
 use tesseract::{Tesseract, PageSegMode};
 
 #[derive(PartialEq)]
 enum SupportedLanguages {
     Eng,
     ChiTra,
+    ChiSim,
 }
 
 impl fmt::Display for SupportedLanguages {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            SupportedLanguages::Eng => write!(f, "eng"),
-            SupportedLanguages::ChiTra => write!(f, "chi_tra"),
+            Self::Eng => write!(f, "eng"),
+            Self::ChiTra => write!(f, "chi_tra"),
+            Self::ChiSim => write!(f, "chi_sim"),
         }
     }
 }
@@ -36,18 +38,22 @@ pub fn execute_ocr(image: &Vec<u8>) -> String {
     wand.read_image_blob(&image).unwrap();
     let image_width = wand.get_image_width();
     let image_height = wand.get_image_height();
-    wand.resize_image(image_width * 5, image_height * 5, FilterTypes::MitchellFilter, 0.5).unwrap()
+    let mut black = PixelWand::new();
+    black.set_color("black");
+    wand.resize_image(image_width * 4, image_height * 4, FilterTypes::MitchellFilter, 0.9).unwrap()
         .normalize_image().unwrap();
+        // .quantize_image(2, graphicsmagick::types::ColorspaceType::GRAYColorspace, 0, 1, 0).unwrap();
 
     wand.set_image_format("PNG").unwrap();
+    wand.write_image("input_image.PNG").unwrap();
     //TODO: Set dpi
     //TODO: Ensure that background is white and text is black
     //TODO: Remove alpha channel
     // https://github.com/tesseract-ocr/tessdoc/blob/main/ImproveQuality.md#inverting-images
 
-    let mut tesseract = Tesseract::new_with_oem(None, Some(&language.to_string()), 
-        tesseract::OcrEngineMode::TesseractLstmCombined).unwrap();
+    let mut tesseract = Tesseract::new(None, Some(&language.to_string())).unwrap();
     tesseract.set_page_seg_mode(PageSegMode::PsmSingleBlock);
+    // let tesseract = tesseract.set_variable("user_defined_dpi", "300").unwrap();
     return tesseract.set_image_from_mem(&wand.write_image_blob().unwrap()).unwrap()
         .recognize().unwrap()
         .get_hocr_text(0).unwrap();

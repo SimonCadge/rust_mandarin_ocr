@@ -306,7 +306,7 @@ fn get_text_child(nodes: &Vec<Node>) -> String {
 
 fn parse_bbox_f32(string: &str) -> f32 {
     let parsed = string.chars().filter(|char| char.is_digit(10)).collect::<String>().parse::<f32>().unwrap();
-    return parsed / 5.0; //OCR image was upscaled 5x before processing
+    return parsed / 4.0; //OCR image was upscaled 4x before processing
 }
 
 pub async fn screen_entry() {
