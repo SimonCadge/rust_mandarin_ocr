@@ -1,24 +1,7 @@
-use core::fmt;
-
 use graphicsmagick::{initialize, types::{FilterTypes}, wand::{MagickWand, PixelWand}};
 use tesseract::{Tesseract, PageSegMode};
 
-#[derive(PartialEq)]
-enum SupportedLanguages {
-    Eng,
-    ChiTra,
-    ChiSim,
-}
-
-impl fmt::Display for SupportedLanguages {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Eng => write!(f, "eng"),
-            Self::ChiTra => write!(f, "chi_tra"),
-            Self::ChiSim => write!(f, "chi_sim"),
-        }
-    }
-}
+use crate::supported_languages::SupportedLanguages;
 
 /* 
 語言來看我用注音

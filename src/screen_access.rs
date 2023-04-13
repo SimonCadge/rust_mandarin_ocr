@@ -3,7 +3,7 @@ use std::{time::Instant, io};
 use html_parser::{Node};
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
-use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, Section, Text};
+use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Point, point, Font}, GlyphBrushBuilder, Text, Layout, GlyphCruncher, OwnedSection, Section, FontId};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -11,7 +11,7 @@ use winit::{
 };
 use screenshots::Screen;
 
-use crate::ocr;
+use crate::{ocr, supported_languages::SupportedLanguages};
 
 struct State {
     surface: wgpu::Surface,
@@ -24,24 +24,89 @@ struct State {
     glyph_brush: GlyphBrush<()>,
     tokio_runtime: Runtime,
     ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
-    ocr_text: Option<Vec<BboxWord>>,
+    ocr_text: Option<Vec<BboxLine>>,
 }
 
+#[derive(Debug, Clone)]
 struct BboxWord {
     text: String,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    min: Point,
+    max: Point,
     is_highlighted: bool,
+    confidence: f32,
+    language: SupportedLanguages,
 }
 
 impl BboxWord {
     fn is_within_bounds(&mut self, position: &PhysicalPosition<f64>) -> bool {
         let cursor_x: f32 = position.x as f32;
         let cursor_y: f32 = position.y as f32;
-        return cursor_x > self.x && cursor_x <= (self.x + self.width)
-            && cursor_y > self.y && cursor_y <= (self.y + self.height);
+        return cursor_x > self.min.x && cursor_x <= self.max.x
+            && cursor_y > self.min.y && cursor_y <= self.max.y;
+    }
+
+    fn to_text(&self, scale: f32) -> Text {
+        return Text::default()
+            .with_text(&self.text)
+            .with_scale(scale)
+            .with_color(self.get_colour())
+            .with_font_id(if self.language == SupportedLanguages::Eng {FontId(0)} else {FontId(1)});
+    }
+
+    fn get_colour(&self) -> [f32; 4] {
+        if self.is_highlighted {
+            return [0.0, 0.0, 0.0, 1.0];
+        } else if self.confidence < 90.0 {
+            return [0.0, 1.0, 0.0, 1.0];
+        } else {
+            return [1.0, 1.0, 1.0, 1.0];
+        }
+    }
+
+    fn get_height(&mut self) -> f32 {
+        return self.max.x - self.min.x;
+    }
+}
+
+struct BboxLine {
+    words: Vec<BboxWord>,
+    is_highlighted: bool,
+}
+
+impl BboxLine {
+    fn new(words: Vec<BboxWord>) -> Self {
+        return Self {
+            words,
+            is_highlighted: false,
+        }
+    }
+
+    fn get_min(&self) -> Point {
+        return self.words[0].min;
+    }
+
+    fn get_max(&self) -> Point {
+        return self.words[self.words.len() - 1].max;
+    }
+
+    fn get_scale(&self) -> f32 {
+        return self.get_max().y - self.get_min().y;
+    }
+
+    fn to_section(&self) -> OwnedSection {
+        let text = self.words.iter().map(|word| word.to_text(self.get_scale())).collect();
+        return Section::default()
+            .with_screen_position((self.get_min().x, self.get_min().y))
+            .with_layout(Layout::default())
+            .with_text(text)
+            .to_owned();
+    }
+
+    fn is_within_bounds(&mut self, position: PhysicalPosition<f64>) -> bool {
+        let cursor_x: f32 = position.x as f32;
+        let cursor_y: f32 = position.y as f32;
+        return cursor_x > self.get_min().x && cursor_x <= self.get_max().x
+            && cursor_y > self.get_min().y && cursor_y <= self.get_max().y;
     }
 }
 
@@ -109,11 +174,14 @@ impl State {
         surface.configure(&device, &config);
 
         // Prepare glyph_brush
-        let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
+        let simhei = ab_glyph::FontArc::try_from_slice(include_bytes!(
             "SimHei.ttf"
         )).unwrap();
+        let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
+            "Inconsolata-Regular.ttf"
+        )).unwrap();
 
-        let glyph_brush = GlyphBrushBuilder::using_font(inconsolata)
+        let glyph_brush = GlyphBrushBuilder::using_fonts(vec![inconsolata, simhei])
             .build(&device, surface_format);
 
         Self {
@@ -178,7 +246,7 @@ impl State {
                 let hocr = block_on(running_job).unwrap().unwrap();
                 println!("{}", hocr);
                 self.ocr_job = None;
-                self.ocr_text = Some(nodes_to_words(&html_parser::Dom::parse(&hocr).unwrap().children));
+                self.ocr_text = Some(self.nodes_to_lines(&html_parser::Dom::parse(&hocr).unwrap().children));
                 self.render().unwrap();
             }
         }
@@ -211,18 +279,11 @@ impl State {
             });
         }
 
-        if let Some(words) = &self.ocr_text {
-            for word in words {
-                self.glyph_brush.queue(Section {
-                    screen_position: (word.x, word.y),
-                    // bounds: (word.width, word.height),
-                    text: vec![Text::new(&word.text)
-                        .with_color(if word.is_highlighted { [1.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] })
-                        .with_scale(word.height)],
-                    ..Section::default()
-                });
+        if let Some(lines) = &self.ocr_text {
+            for line in lines {
+                let section = &line.to_section();
+                self.glyph_brush.queue(section);
             }
-
             self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.size.width, self.size.height).unwrap();
         }
     
@@ -237,12 +298,14 @@ impl State {
     }
 
     fn handle_cursor(&mut self, cursor_position: &PhysicalPosition<f64>) {
-        if let Some(bbox_words) = &mut self.ocr_text {
-            for bbox_word in bbox_words {
-                if bbox_word.is_within_bounds(cursor_position) {
-                    bbox_word.is_highlighted = true;
-                } else {
-                    bbox_word.is_highlighted = false;
+        if let Some(bbox_lines) = &mut self.ocr_text {
+            for line in bbox_lines {
+                for bbox_word in &mut line.words {
+                    if bbox_word.is_within_bounds(cursor_position) {
+                        bbox_word.is_highlighted = true;
+                    } else {
+                        bbox_word.is_highlighted = false;
+                    }
                 }
             }
             self.render().unwrap();
@@ -250,53 +313,75 @@ impl State {
     }
 
     fn handle_click(&self) {
-        if let Some(bbox_words) = &self.ocr_text {
-            for bbox_word in bbox_words {
-                if bbox_word.is_highlighted {
-                    println!("{} - {},{}", bbox_word.text, bbox_word.x, bbox_word.y);
+        if let Some(bbox_lines) = &self.ocr_text {
+            for line in bbox_lines {
+                for bbox_word in &line.words {
+                    if bbox_word.is_highlighted {
+                        println!("{} - {:?},{:?}", bbox_word.text, bbox_word.min, bbox_word.max);
+                    }
                 }
             }
         }
     }
-    
-}
 
-fn nodes_to_words(nodes: &Vec<Node>) -> Vec<BboxWord> {
-    let mut words: Vec<BboxWord> = Vec::new();
-    for node in nodes {
-        if let html_parser::Node::Element(element) = node {
-            if element.classes.contains(&"ocrx_word".to_string()) { // is individual word
-                let title = element.attributes["title"].clone().unwrap();
-                let mut parts = title.split(" ");
-                parts.next();
-                let x = parse_bbox_f32(parts.next().unwrap());
-                let y = parse_bbox_f32(parts.next().unwrap());
-                let width = parse_bbox_f32(parts.next().unwrap()) - x;
-                let height = parse_bbox_f32(parts.next().unwrap()) - y;
-                let text = get_text_child(&element.children);
-                let word = BboxWord {
-                    text,
-                    x,
-                    y,
-                    width,
-                    height,
-                    is_highlighted: false
-                };
-                words.push(word);
-            } else { // call recursively until we reach individual words
-                words.append(&mut nodes_to_words(&node.element().unwrap().children));
+    fn nodes_to_lines(&mut self, nodes: &Vec<Node>) -> Vec<BboxLine> {
+        let mut lines: Vec<BboxLine> = Vec::new();
+        for node in nodes {
+            if let html_parser::Node::Element(element) = node {
+                if element.classes.contains(&"ocr_line".to_string()) { // is individual line
+                    let num_words = element.children.len();
+                    let mut words = Vec::with_capacity(num_words);
+                    for word in &element.children {
+                        if let html_parser::Node::Element(word_element) = word {
+                            let title = word_element.attributes["title"].clone().unwrap();
+                            let mut parts = title.split(" ");
+                            parts.next();
+                            let x = parse_bbox_f32(parts.next().unwrap());
+                            let y = parse_bbox_f32(parts.next().unwrap());
+                            let x2 = parse_bbox_f32(parts.next().unwrap());
+                            let y2 = parse_bbox_f32(parts.next().unwrap());
+                            parts.next();
+                            let confidence = parts.next().unwrap().parse::<f32>().unwrap();
+                            let text = get_text_child(&word_element.children);
+                            let word = BboxWord {
+                                text,
+                                min: point(x, y),
+                                max: point(x2, y2),
+                                is_highlighted: false,
+                                confidence,
+                                language: SupportedLanguages::ChiTra
+                            };
+                            words.push(word);
+                        }
+                    }
+                    println!("Words {:?}", words);
+                    let line = BboxLine::new(words.clone());
+                    let section = &line.to_section();
+                    let font = self.glyph_brush.fonts().to_vec();
+                    for section_glyph in self.glyph_brush.glyphs(section) {
+                        println!("{:?}", section_glyph);
+                        let glyph = &section_glyph.glyph;
+                        let glyph_bounds = font[section_glyph.font_id.0].glyph_bounds(glyph);
+                        let i = section_glyph.section_index;
+                        words[i].min = glyph_bounds.min;
+                        words[i].max = glyph_bounds.max;
+                    }
+                    let line = BboxLine::new(words);
+                    lines.push(line);
+                } else { // call recursively until we reach individual words
+                    lines.append(&mut self.nodes_to_lines(&node.element().unwrap().children));
+                }
             }
         }
+        return lines;
     }
-    return words;
+    
 }
-
-
 
 fn get_text_child(nodes: &Vec<Node>) -> String {
     for node in nodes {
         if let html_parser::Node::Text(text) = node {
-            return text.to_string().trim().to_owned();
+            return text.to_string();
         } else if let html_parser::Node::Element(element) = node {
             return get_text_child(&element.children);
         }
