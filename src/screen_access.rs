@@ -1,9 +1,11 @@
-use std::{time::Instant, io};
+use std::{time::Instant, io, mem, ops::Index};
 
+use bytemuck::{Pod, Zeroable};
 use html_parser::{Node};
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
-use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Point, point, Font}, GlyphBrushBuilder, Text, Layout, GlyphCruncher, OwnedSection, Section, FontId};
+use wgpu::{util::DeviceExt, BufferUsages};
+use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, Text, Layout, GlyphCruncher, OwnedSection, Section, FontId};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -13,25 +15,66 @@ use screenshots::Screen;
 
 use crate::{ocr, supported_languages::SupportedLanguages};
 
-struct State {
-    surface: wgpu::Surface,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    staging_belt: wgpu::util::StagingBelt,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    window: Window,
-    glyph_brush: GlyphBrush<()>,
-    tokio_runtime: Runtime,
-    ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
-    ocr_text: Option<Vec<BboxLine>>,
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PixelPoint {
+    x: f32,
+    y: f32,
+}
+
+impl PixelPoint {
+    fn new(x: f32, y: f32) -> Self {
+        Self {
+            x,
+            y
+        }
+    }
+
+    fn to_normalized_coordinate(self, screen_max_point: PixelPoint) -> [f32; 2] {
+        let x = (self.x / (screen_max_point.x / 2.0)) - 1.0;
+        let y = (self.y / (screen_max_point.y / 2.0)) - 1.0;
+        [x, y]
+    }
+}
+
+impl From<(f32, f32)> for PixelPoint {
+    fn from(pos: (f32, f32)) -> Self {
+        Self { x: pos.0, y: pos.1 }
+    }
+}
+
+impl From<ab_glyph::Point> for PixelPoint {
+    fn from(pos: ab_glyph::Point) -> Self {
+        Self {
+            x: pos.x,
+            y: pos.y
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct BboxWord {
     text: String,
-    min: Point,
-    max: Point,
+    min: PixelPoint,
+    max: PixelPoint,
     is_highlighted: bool,
     confidence: f32,
     language: SupportedLanguages,
@@ -55,16 +98,12 @@ impl BboxWord {
 
     fn get_colour(&self) -> [f32; 4] {
         if self.is_highlighted {
-            return [0.0, 0.0, 0.0, 1.0];
-        } else if self.confidence < 90.0 {
             return [0.0, 1.0, 0.0, 1.0];
+        } else if self.confidence < 90.0 {
+            return [1.0, 0.0, 0.0, 1.0];
         } else {
-            return [1.0, 1.0, 1.0, 1.0];
+            return [0.0, 0.0, 0.0, 1.0];
         }
-    }
-
-    fn get_height(&mut self) -> f32 {
-        return self.max.x - self.min.x;
     }
 }
 
@@ -81,12 +120,16 @@ impl BboxLine {
         }
     }
 
-    fn get_min(&self) -> Point {
-        return self.words[0].min;
+    fn get_min(&self) -> PixelPoint {
+        let smallest_x = self.words.iter().map(|word| word.min.x).min_by(|a, b| a.total_cmp(b)).unwrap();
+        let smallest_y = self.words.iter().map(|word| word.min.y).min_by(|a, b| a.total_cmp(b)).unwrap();
+        return PixelPoint::new(smallest_x, smallest_y);
     }
 
-    fn get_max(&self) -> Point {
-        return self.words[self.words.len() - 1].max;
+    fn get_max(&self) -> PixelPoint {
+        let largest_x = self.words.iter().map(|word| word.max.x).max_by(|a, b| a.total_cmp(b)).unwrap();
+        let largest_y = self.words.iter().map(|word| word.max.y).max_by(|a, b| a.total_cmp(b)).unwrap();
+        return PixelPoint::new(largest_x, largest_y);
     }
 
     fn get_scale(&self) -> f32 {
@@ -102,12 +145,57 @@ impl BboxLine {
             .to_owned();
     }
 
+    fn to_vertices(&self, screen_max_point: PixelPoint, offset: u32) -> (Vec<Vertex>, Vec<u32>) {
+        let min = self.get_min();
+        let max = self.get_max();
+        let verticies = vec![
+            Vertex { //top left
+                position: min.to_normalized_coordinate(screen_max_point),
+                color: [1.0, 1.0, 1.0],
+            },
+            Vertex { //top right
+                position: PixelPoint::new(max.x, min.y).to_normalized_coordinate(screen_max_point),
+                color: [1.0, 1.0, 1.0],
+            },
+            Vertex { //bottom left
+                position: PixelPoint::new(min.x, max.y).to_normalized_coordinate(screen_max_point),
+                color: [1.0, 1.0, 1.0],
+            },
+            Vertex { //bottom right
+                position: max.to_normalized_coordinate(screen_max_point),
+                color: [1.0, 1.0, 1.0],
+            },
+        ];
+        let indices = vec![
+            offset + 0, offset + 1, offset + 2,
+            offset + 2, offset + 1, offset + 3
+        ];
+        return (verticies, indices);
+    }
+
     fn is_within_bounds(&mut self, position: PhysicalPosition<f64>) -> bool {
         let cursor_x: f32 = position.x as f32;
         let cursor_y: f32 = position.y as f32;
         return cursor_x > self.get_min().x && cursor_x <= self.get_max().x
             && cursor_y > self.get_min().y && cursor_y <= self.get_max().y;
     }
+}
+
+struct State {
+    surface: wgpu::Surface,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    staging_belt: wgpu::util::StagingBelt,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    window: Window,
+    glyph_brush: GlyphBrush<()>,
+    tokio_runtime: Runtime,
+    ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
+    ocr_text: Option<Vec<BboxLine>>,
 }
 
 impl State {
@@ -173,6 +261,67 @@ impl State {
         };
         surface.configure(&device, &config);
 
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { 
+            label: Some("Shader"), 
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()), 
+        });
+
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    Vertex::desc()
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { 
+                topology: wgpu::PrimitiveTopology::TriangleList, 
+                strip_index_format: None, 
+                front_face: wgpu::FrontFace::Ccw, 
+                cull_mode: Some(wgpu::Face::Back), 
+                unclipped_depth: false, 
+                polygon_mode: wgpu::PolygonMode::Fill, 
+                conservative: false },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { 
+                count: 1, 
+                mask: !0, 
+                alpha_to_coverage_enabled: false 
+            },
+            multiview: None,
+        });
+
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Vertex Buffer"),
+            size: 10000 * mem::size_of::<Vertex>() as u64, //Assuming we never need more than 1000 vertices
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Index Buffer"),
+            size: 10000 * mem::size_of::<u16>() as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Prepare glyph_brush
         let simhei = ab_glyph::FontArc::try_from_slice(include_bytes!(
             "SimHei.ttf"
@@ -192,6 +341,9 @@ impl State {
             staging_belt: wgpu::util::StagingBelt::new(1024),
             config,
             size,
+            render_pipeline,
+            vertex_buffer,
+            index_buffer,
             glyph_brush,
             tokio_runtime: runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -260,7 +412,7 @@ impl State {
         });
 
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -277,6 +429,29 @@ impl State {
                 })],
                 depth_stencil_attachment: None,
             });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+
+            if let Some(lines) = &self.ocr_text {
+                let mut vertices: Vec<Vertex> = Vec::with_capacity(10000 * mem::size_of::<Vertex>());
+                let mut indices: Vec<u32> = Vec::with_capacity(10000 * mem::size_of::<u32>());
+                let mut offset = 0;
+                let mut num_indices = 0;
+                let screen_size = PixelPoint::new(self.config.width as f32, self.config.height as f32);
+                for line in lines {
+                    let (mut line_vertices, mut line_indices) = line.to_vertices(screen_size, offset);
+                    offset += line_vertices.len() as u32;
+                    vertices.append(&mut line_vertices);
+                    num_indices += line_indices.len() as u32;
+                    indices.append(&mut line_indices);
+                }
+                self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+                self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..num_indices, 0, 0..1);
+            }
         }
 
         if let Some(lines) = &self.ocr_text {
@@ -288,7 +463,6 @@ impl State {
         }
     
         self.staging_belt.finish();
-        // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -345,8 +519,8 @@ impl State {
                             let text = get_text_child(&word_element.children);
                             let word = BboxWord {
                                 text,
-                                min: point(x, y),
-                                max: point(x2, y2),
+                                min: PixelPoint::new(x, y),
+                                max: PixelPoint::new(x2, y2),
                                 is_highlighted: false,
                                 confidence,
                                 language: SupportedLanguages::ChiTra
@@ -363,8 +537,8 @@ impl State {
                         let glyph = &section_glyph.glyph;
                         let glyph_bounds = font[section_glyph.font_id.0].glyph_bounds(glyph);
                         let i = section_glyph.section_index;
-                        words[i].min = glyph_bounds.min;
-                        words[i].max = glyph_bounds.max;
+                        words[i].min = PixelPoint::from(glyph_bounds.min);
+                        words[i].max = PixelPoint::from(glyph_bounds.max);
                     }
                     let line = BboxLine::new(words);
                     lines.push(line);

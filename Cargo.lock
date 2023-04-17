@@ -526,6 +526,7 @@ dependencies = [
 name = "decky_translate"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "chinese_dictionary",
  "clipboard",
  "env_logger",

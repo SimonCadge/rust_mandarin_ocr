@@ -24,8 +24,8 @@ pub fn execute_ocr(image: &Vec<u8>) -> String {
     let mut black = PixelWand::new();
     black.set_color("black");
     wand.resize_image(image_width * 4, image_height * 4, FilterTypes::MitchellFilter, 0.9).unwrap()
-        .normalize_image().unwrap();
-        // .quantize_image(2, graphicsmagick::types::ColorspaceType::GRAYColorspace, 0, 1, 0).unwrap();
+        .normalize_image().unwrap()
+        .quantize_image(2, graphicsmagick::types::ColorspaceType::GRAYColorspace, 0, 1, 0).unwrap();
 
     wand.set_image_format("PNG").unwrap();
     wand.write_image("input_image.PNG").unwrap();
