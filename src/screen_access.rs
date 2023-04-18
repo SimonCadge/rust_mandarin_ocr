@@ -1,25 +1,26 @@
-use std::{time::Instant, io, mem, ops::Index};
+use std::{io, mem};
 
 use bytemuck::{Pod, Zeroable};
-use html_parser::{Node};
+use chinese_dictionary::{query, WordEntry, tokenize};
+use html_parser::Node;
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
-use wgpu::{util::DeviceExt, BufferUsages};
-use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, Text, Layout, GlyphCruncher, OwnedSection, Section, FontId};
+use wgpu::{BufferUsages, SurfaceConfiguration};
+use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::{WindowBuilder, Window}, dpi::PhysicalPosition,
+    window::{WindowBuilder, Window}, dpi::PhysicalSize,
 };
 use screenshots::Screen;
 
-use crate::{ocr, supported_languages::SupportedLanguages};
+use crate::{ocr, supported_languages::SupportedLanguages, positioning_structs::{BboxLine, PixelPoint, BboxWord}};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Vertex {
-    position: [f32; 2],
-    color: [f32; 3],
+pub struct Vertex {
+    pub position: [f32; 2],
+    pub color: [f32; 3],
 }
 
 impl Vertex {
@@ -34,175 +35,43 @@ impl Vertex {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PixelPoint {
-    x: f32,
-    y: f32,
+struct WindowState {
+    window: Window,
+    surface: wgpu::Surface,
+    config: SurfaceConfiguration,
+    size: PhysicalSize<u32>
 }
 
-impl PixelPoint {
-    fn new(x: f32, y: f32) -> Self {
-        Self {
-            x,
-            y
+impl WindowState {
+    fn resize(&mut self, device: &wgpu::Device, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(device, &self.config);
         }
-    }
-
-    fn to_normalized_coordinate(self, screen_max_point: PixelPoint) -> [f32; 2] {
-        let x = (self.x / (screen_max_point.x / 2.0)) - 1.0;
-        let y = (self.y / (screen_max_point.y / 2.0)) - 1.0;
-        [x, y]
-    }
-}
-
-impl From<(f32, f32)> for PixelPoint {
-    fn from(pos: (f32, f32)) -> Self {
-        Self { x: pos.0, y: pos.1 }
-    }
-}
-
-impl From<ab_glyph::Point> for PixelPoint {
-    fn from(pos: ab_glyph::Point) -> Self {
-        Self {
-            x: pos.x,
-            y: pos.y
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BboxWord {
-    text: String,
-    min: PixelPoint,
-    max: PixelPoint,
-    is_highlighted: bool,
-    confidence: f32,
-    language: SupportedLanguages,
-}
-
-impl BboxWord {
-    fn is_within_bounds(&mut self, position: &PhysicalPosition<f64>) -> bool {
-        let cursor_x: f32 = position.x as f32;
-        let cursor_y: f32 = position.y as f32;
-        return cursor_x > self.min.x && cursor_x <= self.max.x
-            && cursor_y > self.min.y && cursor_y <= self.max.y;
-    }
-
-    fn to_text(&self, scale: f32) -> Text {
-        return Text::default()
-            .with_text(&self.text)
-            .with_scale(scale)
-            .with_color(self.get_colour())
-            .with_font_id(if self.language == SupportedLanguages::Eng {FontId(0)} else {FontId(1)});
-    }
-
-    fn get_colour(&self) -> [f32; 4] {
-        if self.is_highlighted {
-            return [0.0, 1.0, 0.0, 1.0];
-        } else if self.confidence < 90.0 {
-            return [1.0, 0.0, 0.0, 1.0];
-        } else {
-            return [0.0, 0.0, 0.0, 1.0];
-        }
-    }
-}
-
-struct BboxLine {
-    words: Vec<BboxWord>,
-    is_highlighted: bool,
-}
-
-impl BboxLine {
-    fn new(words: Vec<BboxWord>) -> Self {
-        return Self {
-            words,
-            is_highlighted: false,
-        }
-    }
-
-    fn get_min(&self) -> PixelPoint {
-        let smallest_x = self.words.iter().map(|word| word.min.x).min_by(|a, b| a.total_cmp(b)).unwrap();
-        let smallest_y = self.words.iter().map(|word| word.min.y).min_by(|a, b| a.total_cmp(b)).unwrap();
-        return PixelPoint::new(smallest_x, smallest_y);
-    }
-
-    fn get_max(&self) -> PixelPoint {
-        let largest_x = self.words.iter().map(|word| word.max.x).max_by(|a, b| a.total_cmp(b)).unwrap();
-        let largest_y = self.words.iter().map(|word| word.max.y).max_by(|a, b| a.total_cmp(b)).unwrap();
-        return PixelPoint::new(largest_x, largest_y);
-    }
-
-    fn get_scale(&self) -> f32 {
-        return self.get_max().y - self.get_min().y;
-    }
-
-    fn to_section(&self) -> OwnedSection {
-        let text = self.words.iter().map(|word| word.to_text(self.get_scale())).collect();
-        return Section::default()
-            .with_screen_position((self.get_min().x, self.get_min().y))
-            .with_layout(Layout::default())
-            .with_text(text)
-            .to_owned();
-    }
-
-    fn to_vertices(&self, screen_max_point: PixelPoint, offset: u32) -> (Vec<Vertex>, Vec<u32>) {
-        let min = self.get_min();
-        let max = self.get_max();
-        let verticies = vec![
-            Vertex { //top left
-                position: min.to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
-            },
-            Vertex { //top right
-                position: PixelPoint::new(max.x, min.y).to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
-            },
-            Vertex { //bottom left
-                position: PixelPoint::new(min.x, max.y).to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
-            },
-            Vertex { //bottom right
-                position: max.to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
-            },
-        ];
-        let indices = vec![
-            offset + 0, offset + 1, offset + 2,
-            offset + 2, offset + 1, offset + 3
-        ];
-        return (verticies, indices);
-    }
-
-    fn is_within_bounds(&mut self, position: PhysicalPosition<f64>) -> bool {
-        let cursor_x: f32 = position.x as f32;
-        let cursor_y: f32 = position.y as f32;
-        return cursor_x > self.get_min().x && cursor_x <= self.get_max().x
-            && cursor_y > self.get_min().y && cursor_y <= self.get_max().y;
     }
 }
 
 struct State {
-    surface: wgpu::Surface,
+    main_window_state: WindowState,
+    popup_window_state: WindowState,
     device: wgpu::Device,
     queue: wgpu::Queue,
     staging_belt: wgpu::util::StagingBelt,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    window: Window,
+    popup_text: Option<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
-    tokio_runtime: Runtime,
+    ocr_runtime: Runtime,
     ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
     ocr_text: Option<Vec<BboxLine>>,
 }
 
 impl State {
     // Creating some of the wgpu types requires async code
-    async fn new(window: Window) -> Self {
-        let size = window.inner_size();
-
+    async fn new(main_window: Window, popup_window: Window) -> Self {
         // The instance is a handle to our GPU
         // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -214,13 +83,14 @@ impl State {
         //
         // The surface needs to live as long as the window that created it.
         // State owns the window so this should be safe.
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
-
+        let main_window_surface = unsafe { instance.create_surface(&main_window) }.unwrap();
+        let popup_window_surface = unsafe { instance.create_surface(&popup_window) }.unwrap();
+        
         let adapter = instance
         .enumerate_adapters(wgpu::Backends::all())
         .filter(|adapter| {
             // Check if this adapter supports our surface
-            adapter.is_surface_supported(&surface)
+            adapter.is_surface_supported(&main_window_surface)
         })
         .next()
         .unwrap();
@@ -240,7 +110,7 @@ impl State {
             None, // Trace path
         ).await.unwrap();
 
-        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_caps = main_window_surface.get_capabilities(&adapter);
 
         // Shader code in this tutorial assumes an sRGB surface texture. Using a different
         // one will result all the colors coming out darker. If you want to support non
@@ -250,16 +120,9 @@ impl State {
             .filter(|f| f.describe().srgb)
             .next()
             .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &config);
+
+        let main_window_state = configure_main_window(main_window, surface_format, &surface_caps, main_window_surface, &device);
+        let popup_window_state = configure_popup_window(popup_window, surface_format, &surface_caps, popup_window_surface, &device);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { 
             label: Some("Shader"), 
@@ -286,7 +149,7 @@ impl State {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: main_window_state.config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -334,37 +197,23 @@ impl State {
             .build(&device, surface_format);
 
         Self {
-            window,
-            surface,
+            main_window_state,
+            popup_window_state,
             device,
             queue,
             staging_belt: wgpu::util::StagingBelt::new(1024),
-            config,
-            size,
             render_pipeline,
             vertex_buffer,
             index_buffer,
             glyph_brush,
-            tokio_runtime: runtime::Builder::new_multi_thread()
+            ocr_runtime: runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .thread_name("ocr_worker")
                 .build()
                 .unwrap(),
             ocr_job: None,
             ocr_text: None,
-        }
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            popup_text: None
         }
     }
 
@@ -378,15 +227,13 @@ impl State {
             self.ocr_job = None;
             self.ocr_text = None;
         }
-        let window_size = self.window.inner_size();
-        let window_inner_position = self.window.inner_position().unwrap();
-        self.ocr_job = Some(self.tokio_runtime.spawn(async move {
-            let start_time = Instant::now();
+        let window_size = self.main_window_state.window.inner_size();
+        let window_inner_position = self.main_window_state.window.inner_position().unwrap();
+        self.ocr_job = Some(self.ocr_runtime.spawn(async move {
             let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
             let display_position = screen.display_info;
             let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
             let buffer = image.buffer();
-            println!("Screenshot took {} ms", start_time.elapsed().as_millis());
             return Ok(ocr::execute_ocr(buffer));
         }));
     }
@@ -396,16 +243,15 @@ impl State {
             let running_job = self.ocr_job.as_mut().unwrap();
             if running_job.is_finished() {
                 let hocr = block_on(running_job).unwrap().unwrap();
-                println!("{}", hocr);
                 self.ocr_job = None;
                 self.ocr_text = Some(self.nodes_to_lines(&html_parser::Dom::parse(&hocr).unwrap().children));
-                self.render().unwrap();
+                self.render_main_window().unwrap();
             }
         }
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+    fn render_main_window(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let output = self.main_window_state.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -437,7 +283,7 @@ impl State {
                 let mut indices: Vec<u32> = Vec::with_capacity(10000 * mem::size_of::<u32>());
                 let mut offset = 0;
                 let mut num_indices = 0;
-                let screen_size = PixelPoint::new(self.config.width as f32, self.config.height as f32);
+                let screen_size = PixelPoint::new(self.main_window_state.config.width as f32, self.main_window_state.config.height as f32);
                 for line in lines {
                     let (mut line_vertices, mut line_indices) = line.to_vertices(screen_size, offset);
                     offset += line_vertices.len() as u32;
@@ -459,7 +305,7 @@ impl State {
                 let section = &line.to_section();
                 self.glyph_brush.queue(section);
             }
-            self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.size.width, self.size.height).unwrap();
+            self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.main_window_state.size.width, self.main_window_state.size.height).unwrap();
         }
     
         self.staging_belt.finish();
@@ -470,28 +316,71 @@ impl State {
     
         Ok(())
     }
+    
+    fn render_popup_window(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let output = self.popup_window_state.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
+        
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+        }
+        
+        if let Some(text) = &self.popup_text {
+            self.glyph_brush.queue(text);
+            self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.popup_window_state.size.width, self.popup_window_state.size.height).unwrap();
+        }
 
-    fn handle_cursor(&mut self, cursor_position: &PhysicalPosition<f64>) {
+        self.staging_belt.finish();
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        self.staging_belt.recall();
+    
+        Ok(())
+    }
+
+    fn handle_cursor(&mut self, cursor_position: &PixelPoint) {
         if let Some(bbox_lines) = &mut self.ocr_text {
             for line in bbox_lines {
-                for bbox_word in &mut line.words {
+                for bbox_word in line.get_mut_words() {
                     if bbox_word.is_within_bounds(cursor_position) {
-                        bbox_word.is_highlighted = true;
+                        bbox_word.set_highlighted(true);
                     } else {
-                        bbox_word.is_highlighted = false;
+                        bbox_word.set_highlighted(false);
                     }
                 }
             }
-            self.render().unwrap();
+            self.render_main_window().unwrap();
         }
     }
 
-    fn handle_click(&self) {
+    fn handle_click(&mut self) {
         if let Some(bbox_lines) = &self.ocr_text {
             for line in bbox_lines {
-                for bbox_word in &line.words {
-                    if bbox_word.is_highlighted {
-                        println!("{} - {:?},{:?}", bbox_word.text, bbox_word.min, bbox_word.max);
+                for bbox_word in line.get_words() {
+                    if bbox_word.is_highlighted() {
+                        println!("{} - {:?},{:?}", bbox_word.get_text(), bbox_word.get_min(), bbox_word.get_max());
+                        self.popup_text = Some(bbox_word.generate_translation_section());
+                        self.popup_window_state.window.request_redraw();
                     }
                 }
             }
@@ -517,28 +406,42 @@ impl State {
                             parts.next();
                             let confidence = parts.next().unwrap().parse::<f32>().unwrap();
                             let text = get_text_child(&word_element.children);
-                            let word = BboxWord {
+                            let word = BboxWord::new(
                                 text,
-                                min: PixelPoint::new(x, y),
-                                max: PixelPoint::new(x2, y2),
-                                is_highlighted: false,
+                                PixelPoint::new(x, y),
+                                PixelPoint::new(x2, y2),
+                                false,
                                 confidence,
-                                language: SupportedLanguages::ChiTra
-                            };
+                                SupportedLanguages::ChiTra
+                            );
                             words.push(word);
                         }
                     }
-                    println!("Words {:?}", words);
-                    let line = BboxLine::new(words.clone());
+                    let raw_text: String = words.iter().map(|bbox_word| bbox_word.get_text().to_string()).collect();
+                    let tokenized_text = tokenize(&raw_text);
+                    let mut tokenized_words = Vec::with_capacity(tokenized_text.len());
+                    let mut i = 0;
+                    for token in tokenized_text {
+                        let first_char = token.as_bytes()[0];
+                        if let Some((index, _word)) = words.iter().map(|bbox_word| bbox_word.get_text()).enumerate().skip(i).find(|(_i, word)| word.as_bytes()[0] == first_char) {
+                            for y in i .. index {
+                                tokenized_words.push(words[y].clone());
+                            }
+                            i = index;
+                            let len = token.len();
+                            tokenized_words.push(words[i+1 .. i+len].iter().fold(words[i].clone(), |lhs, rhs| lhs + rhs));
+                            i += len;
+                        }
+                    }
+                    let line = BboxLine::new(tokenized_words);
                     let section = &line.to_section();
                     let font = self.glyph_brush.fonts().to_vec();
                     for section_glyph in self.glyph_brush.glyphs(section) {
-                        println!("{:?}", section_glyph);
                         let glyph = &section_glyph.glyph;
                         let glyph_bounds = font[section_glyph.font_id.0].glyph_bounds(glyph);
                         let i = section_glyph.section_index;
-                        words[i].min = PixelPoint::from(glyph_bounds.min);
-                        words[i].max = PixelPoint::from(glyph_bounds.max);
+                        words[i].set_min(PixelPoint::from(glyph_bounds.min));
+                        words[i].set_max(PixelPoint::from(glyph_bounds.max));
                     }
                     let line = BboxLine::new(words);
                     lines.push(line);
@@ -550,6 +453,46 @@ impl State {
         return lines;
     }
     
+}
+
+fn configure_main_window(window: Window, surface_format: wgpu::TextureFormat, surface_caps: &wgpu::SurfaceCapabilities, surface: wgpu::Surface, device: &wgpu::Device) -> WindowState {
+    let size = window.inner_size();
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        format: surface_format,
+        width: size.width,
+        height: size.height,
+        present_mode: surface_caps.present_modes[0],
+        alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+        view_formats: vec![],
+    };
+    surface.configure(device, &config);
+    WindowState {
+        window,
+        surface,
+        config,
+        size
+    }
+}
+
+fn configure_popup_window(window: Window, surface_format: wgpu::TextureFormat, surface_caps: &wgpu::SurfaceCapabilities, surface: wgpu::Surface, device: &wgpu::Device) -> WindowState {
+    let size = window.inner_size();
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        format: surface_format,
+        width: size.width,
+        height: size.height,
+        present_mode: surface_caps.present_modes[0],
+        alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+        view_formats: vec![],
+    };
+    surface.configure(device, &config);
+    WindowState {
+        window,
+        surface,
+        config,
+        size
+    }
 }
 
 fn get_text_child(nodes: &Vec<Node>) -> String {
@@ -571,16 +514,19 @@ fn parse_bbox_f32(string: &str) -> f32 {
 pub async fn screen_entry() {
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().with_transparent(true).build(&event_loop).unwrap();
+    let main_window = WindowBuilder::new().with_transparent(true).build(&event_loop).unwrap();
+    let main_window_id = main_window.id();
+    let popup_window = WindowBuilder::new().with_decorations(false).build(&event_loop).unwrap();
+    let popup_window_id = popup_window.id();
 
-    let mut window_state = State::new(window).await;
+    let mut window_state = State::new(main_window, popup_window).await;
 
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
                 ref event,
                 window_id,
-            } if window_id == window_state.window().id() => if !window_state.input(event) {
+            } if window_id == window_state.main_window_state.window.id() => if !window_state.input(event) {
                 match event {
                     WindowEvent::CloseRequested
                     | WindowEvent::KeyboardInput {
@@ -593,16 +539,16 @@ pub async fn screen_entry() {
                         ..
                     } => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(physical_size) => {
-                        window_state.resize(*physical_size);
+                        window_state.main_window_state.resize(&window_state.device, *physical_size);
                     }
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        window_state.resize(**new_inner_size);
+                        window_state.main_window_state.resize(&window_state.device, **new_inner_size);
                     }
                     WindowEvent::Moved(_) => {
-                        window_state.window().request_redraw();
+                        window_state.main_window_state.window.request_redraw();
                     }
                     WindowEvent::CursorMoved { device_id: _, position, modifiers: _ } => {
-                        window_state.handle_cursor(position);
+                        window_state.handle_cursor(&PixelPoint::from(position));
                     }
                     WindowEvent::MouseInput { device_id: _, state, button: _, modifiers: _ } => {
                         if let ElementState::Released = state {
@@ -612,16 +558,32 @@ pub async fn screen_entry() {
                     _ => {}
                 }
             }
-            Event::RedrawRequested(window_id) if window_id == window_state.window().id() => {
-                window_state.update();
-                match window_state.render() {
-                    Ok(_) => {}
-                    // Reconfigure the surface if lost
-                    Err(wgpu::SurfaceError::Lost) => window_state.resize(window_state.size),
-                    // The system is out of memory, we should probably quit
-                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    // All other errors (Outdated, Timeout) should be resolved by the next frame
-                    Err(e) => eprintln!("{:?}", e),
+            Event::RedrawRequested(window_id) => {
+                match window_id {
+                    _ if window_id == main_window_id => {
+                        window_state.update();
+                        match window_state.render_main_window() {
+                            Ok(_) => {}
+                            // Reconfigure the surface if lost
+                            Err(wgpu::SurfaceError::Lost) => window_state.main_window_state.resize(&window_state.device, window_state.main_window_state.size),
+                            // The system is out of memory, we should probably quit
+                            Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                            // All other errors (Outdated, Timeout) should be resolved by the next frame
+                            Err(e) => eprintln!("{:?}", e),
+                        }
+                    },
+                    _ if window_id == popup_window_id => {
+                        match window_state.render_popup_window() {
+                            Ok(_) => {}
+                            // Reconfigure the surface if lost
+                            Err(wgpu::SurfaceError::Lost) => window_state.popup_window_state.resize(&window_state.device, window_state.popup_window_state.size),
+                            // The system is out of memory, we should probably quit
+                            Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                            // All other errors (Outdated, Timeout) should be resolved by the next frame
+                            Err(e) => eprintln!("{:?}", e),
+                        }
+                    },
+                    _ => {}
                 }
             }
             Event::MainEventsCleared => {
@@ -634,5 +596,3 @@ pub async fn screen_entry() {
         }
     });
 }
-
-// https://sotrh.github.io/learn-wgpu/beginner/tutorial2-surface/#render
