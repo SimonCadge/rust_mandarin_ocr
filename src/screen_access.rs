@@ -1,7 +1,7 @@
 use std::{io, mem};
 
 use bytemuck::{Pod, Zeroable};
-use chinese_dictionary::{query, WordEntry, tokenize};
+use chinese_dictionary::tokenize;
 use html_parser::Node;
 use pollster::block_on;
 use tokio::{task, runtime::{Runtime, self}};
@@ -10,7 +10,7 @@ use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, GlyphCru
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::{WindowBuilder, Window}, dpi::PhysicalSize,
+    window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition},
 };
 use screenshots::Screen;
 
@@ -49,7 +49,14 @@ impl WindowState {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(device, &self.config);
+            if self.window.inner_size() != new_size { //When we have changed the size in code
+                self.window.set_inner_size(new_size);
+            }
         }
+    }
+
+    fn set_visible(&mut self, is_visible: bool) {
+        self.window.set_visible(is_visible);
     }
 }
 
@@ -122,6 +129,7 @@ impl State {
             .unwrap_or(surface_caps.formats[0]);
 
         let main_window_state = configure_main_window(main_window, surface_format, &surface_caps, main_window_surface, &device);
+        popup_window.set_visible(false);
         let popup_window_state = configure_popup_window(popup_window, surface_format, &surface_caps, popup_window_surface, &device);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { 
@@ -318,6 +326,7 @@ impl State {
     }
     
     fn render_popup_window(&mut self) -> Result<(), wgpu::SurfaceError> {
+        println!("Rendering Popup Window");
         let output = self.popup_window_state.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -374,16 +383,37 @@ impl State {
     }
 
     fn handle_click(&mut self) {
+        let mut something_clicked = false;
         if let Some(bbox_lines) = &self.ocr_text {
             for line in bbox_lines {
                 for bbox_word in line.get_words() {
                     if bbox_word.is_highlighted() {
                         println!("{} - {:?},{:?}", bbox_word.get_text(), bbox_word.get_min(), bbox_word.get_max());
-                        self.popup_text = Some(bbox_word.generate_translation_section());
+                        let (text_section, bounds) = bbox_word.generate_translation_section(&mut self.glyph_brush);
+                        self.popup_text = Some(text_section);
+                        let new_size = PhysicalSize { 
+                            width: (bounds.max.x - bounds.min.x) as u32, 
+                            height: (bounds.max.y - bounds.min.y) as u32 
+                        };
+                        self.popup_window_state.resize(&self.device, new_size);
+                        self.popup_window_state.set_visible(true);
+                        let main_window_position = self.main_window_state.window.inner_position().unwrap();
+                        let popup_new_position = PhysicalPosition {
+                            x: main_window_position.x as u32 + bbox_word.get_min().get_x() as u32 - (new_size.width / 2) + ((bbox_word.get_max().get_x() - bbox_word.get_min().get_x()) as u32 / 2),
+                            y: main_window_position.y as u32 + bbox_word.get_min().get_y() as u32 - new_size.height - 10,
+                        };
+                        self.popup_window_state.window.set_outer_position(popup_new_position);
+                        self.popup_window_state.window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
                         self.popup_window_state.window.request_redraw();
+                        something_clicked = true;
                     }
                 }
             }
+        }
+        if !something_clicked {
+            self.popup_text = None;
+            self.popup_window_state.set_visible(false);
+            self.popup_window_state.window.request_redraw();
         }
     }
 
@@ -428,22 +458,26 @@ impl State {
                                 tokenized_words.push(words[y].clone());
                             }
                             i = index;
-                            let len = token.len();
+                            let len = token.chars().count();
                             tokenized_words.push(words[i+1 .. i+len].iter().fold(words[i].clone(), |lhs, rhs| lhs + rhs));
                             i += len;
                         }
                     }
-                    let line = BboxLine::new(tokenized_words);
+                    let line = BboxLine::new(tokenized_words.clone());
                     let section = &line.to_section();
                     let font = self.glyph_brush.fonts().to_vec();
                     for section_glyph in self.glyph_brush.glyphs(section) {
                         let glyph = &section_glyph.glyph;
                         let glyph_bounds = font[section_glyph.font_id.0].glyph_bounds(glyph);
                         let i = section_glyph.section_index;
-                        words[i].set_min(PixelPoint::from(glyph_bounds.min));
-                        words[i].set_max(PixelPoint::from(glyph_bounds.max));
+                        if section_glyph.byte_index == 0 {
+                            tokenized_words[i].set_min(PixelPoint::from(glyph_bounds.min));
+                            tokenized_words[i].set_max(PixelPoint::from(glyph_bounds.max));
+                        } else {
+                            tokenized_words[i].set_max(PixelPoint::from(glyph_bounds.max));
+                        }
                     }
-                    let line = BboxLine::new(words);
+                    let line = BboxLine::new(tokenized_words);
                     lines.push(line);
                 } else { // call recursively until we reach individual words
                     lines.append(&mut self.nodes_to_lines(&node.element().unwrap().children));

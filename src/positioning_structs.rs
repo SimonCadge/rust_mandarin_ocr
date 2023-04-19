@@ -1,7 +1,7 @@
 use std::{ops::{Sub, Add}, cmp::{min, max}};
 
 use chinese_dictionary::query_by_chinese;
-use wgpu_glyph::{ab_glyph, Text, FontId, OwnedSection, Section, Layout, OwnedText};
+use wgpu_glyph::{ab_glyph::{self, Rect}, Text, FontId, OwnedSection, Section, Layout, OwnedText, GlyphBrush, GlyphCruncher};
 use winit::dpi::{PhysicalPosition, Size, PhysicalSize};
 
 use crate::{supported_languages::SupportedLanguages, screen_access::Vertex};
@@ -188,7 +188,7 @@ impl BboxWord {
         }
     }
 
-    pub fn generate_translation_section(&self) -> OwnedSection {
+    pub fn generate_translation_section(&self, glyph_brush: &mut GlyphBrush<()>) -> (OwnedSection, Rect) {
         let translations = query_by_chinese(&self.text);
         let mut translations_as_string = Vec::with_capacity(translations.len());
         for translation in translations {
@@ -198,12 +198,18 @@ impl BboxWord {
             translation_as_string.push_str(&translation.pinyin_marks);
             translation_as_string.push_str("): \t");
             translation_as_string.push_str(&translation.english.join("\n          "));
-            translations_as_string.push(OwnedText::new(&translation_as_string).with_font_id(FontId(1)));
+            translations_as_string.push(OwnedText::new(&translation_as_string)
+                .with_font_id(FontId(1))
+                .with_scale(24.0));
         }
 
-        Section::default()
+        let section = Section::default()
             .to_owned()
-            .with_text(translations_as_string)
+            .with_text(translations_as_string);
+
+        let bounds = glyph_brush.glyph_bounds(&section).unwrap();
+
+        (section, bounds)
     }
 }
 
