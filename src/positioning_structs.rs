@@ -198,6 +198,7 @@ impl BboxWord {
             translation_as_string.push_str(&translation.pinyin_marks);
             translation_as_string.push_str("): \t");
             translation_as_string.push_str(&translation.english.join("\n          "));
+            translation_as_string.push_str("\n");
             translations_as_string.push(OwnedText::new(&translation_as_string)
                 .with_font_id(FontId(1))
                 .with_scale(24.0));
