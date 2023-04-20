@@ -237,7 +237,9 @@ impl State {
         }
         let window_size = self.main_window_state.window.inner_size();
         let window_inner_position = self.main_window_state.window.inner_position().unwrap();
+        println!("About to trigger threaded job");
         self.ocr_job = Some(self.ocr_runtime.spawn(async move {
+            println!("Threaded job triggered");
             let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
             let display_position = screen.display_info;
             let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
@@ -326,7 +328,6 @@ impl State {
     }
     
     fn render_popup_window(&mut self) -> Result<(), wgpu::SurfaceError> {
-        println!("Rendering Popup Window");
         let output = self.popup_window_state.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -388,7 +389,6 @@ impl State {
             for line in bbox_lines {
                 for bbox_word in line.get_words() {
                     if bbox_word.is_highlighted() {
-                        println!("{} - {:?},{:?}", bbox_word.get_text(), bbox_word.get_min(), bbox_word.get_max());
                         let (text_section, bounds) = bbox_word.generate_translation_section(&mut self.glyph_brush);
                         self.popup_text = Some(text_section);
                         let new_size = PhysicalSize { 
