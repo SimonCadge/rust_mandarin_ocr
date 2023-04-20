@@ -1,10 +1,8 @@
-use std::{io, mem};
+use std::{mem, thread::{JoinHandle, self}, sync::mpsc::{Sender, Receiver, self}};
 
 use bytemuck::{Pod, Zeroable};
 use chinese_dictionary::tokenize;
 use html_parser::Node;
-use pollster::block_on;
-use tokio::{task, runtime::{Runtime, self}};
 use wgpu::{BufferUsages, SurfaceConfiguration};
 use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
 use winit::{
@@ -12,7 +10,6 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition},
 };
-use screenshots::Screen;
 
 use crate::{ocr, supported_languages::SupportedLanguages, positioning_structs::{BboxLine, PixelPoint, BboxWord}};
 
@@ -71,8 +68,9 @@ struct State {
     index_buffer: wgpu::Buffer,
     popup_text: Option<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
-    ocr_runtime: Runtime,
-    ocr_job: Option<task::JoinHandle<Result<String, io::Error>>>,
+    ocr_thread: JoinHandle<()>,
+    ocr_send_channel: Sender<(i32, i32, u32, u32)>,
+    ocr_receive_channel: Receiver<String>,
     ocr_text: Option<Vec<BboxLine>>,
 }
 
@@ -204,6 +202,13 @@ impl State {
         let glyph_brush = GlyphBrushBuilder::using_fonts(vec![inconsolata, simhei])
             .build(&device, surface_format);
 
+        let (main_thread_send_channel, worker_thread_receive_channel) = mpsc::channel();
+        let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel();
+
+        let ocr_thread = thread::spawn(move || {
+            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel);
+        });
+
         Self {
             main_window_state,
             popup_window_state,
@@ -214,12 +219,9 @@ impl State {
             vertex_buffer,
             index_buffer,
             glyph_brush,
-            ocr_runtime: runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("ocr_worker")
-                .build()
-                .unwrap(),
-            ocr_job: None,
+            ocr_thread,
+            ocr_send_channel: main_thread_send_channel,
+            ocr_receive_channel: main_thread_receive_channel,
             ocr_text: None,
             popup_text: None
         }
@@ -230,33 +232,18 @@ impl State {
     }
 
     fn update(&mut self) {
-        if let Some(running_job) = &self.ocr_job {
-            running_job.abort();
-            self.ocr_job = None;
+        if self.ocr_text.is_some() {
             self.ocr_text = None;
         }
         let window_size = self.main_window_state.window.inner_size();
         let window_inner_position = self.main_window_state.window.inner_position().unwrap();
-        println!("About to trigger threaded job");
-        self.ocr_job = Some(self.ocr_runtime.spawn(async move {
-            println!("Threaded job triggered");
-            let screen = Screen::from_point(window_inner_position.x, window_inner_position.y).unwrap();
-            let display_position = screen.display_info;
-            let image = screen.capture_area(window_inner_position.x - display_position.x, window_inner_position.y - display_position.y, window_size.width, window_size.height).unwrap();
-            let buffer = image.buffer();
-            return Ok(ocr::execute_ocr(buffer));
-        }));
+        self.ocr_send_channel.send((window_inner_position.x, window_inner_position.y, window_size.width, window_size.height)).unwrap();
     }
 
     fn check_running_job(&mut self) {
-        if self.ocr_job.is_some() {
-            let running_job = self.ocr_job.as_mut().unwrap();
-            if running_job.is_finished() {
-                let hocr = block_on(running_job).unwrap().unwrap();
-                self.ocr_job = None;
-                self.ocr_text = Some(self.nodes_to_lines(&html_parser::Dom::parse(&hocr).unwrap().children));
-                self.render_main_window().unwrap();
-            }
+        if let Ok(ocr_text) = self.ocr_receive_channel.try_recv() {
+            self.ocr_text = Some(self.nodes_to_lines(&html_parser::Dom::parse(&ocr_text).unwrap().children));
+            self.render_main_window().unwrap();
         }
     }
 

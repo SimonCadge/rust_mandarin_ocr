@@ -234,12 +234,14 @@ impl BboxLine {
     }
 
     pub fn get_min(&self) -> PixelPoint {
+        if self.words.is_empty() {return PixelPoint::new(0.0, 0.0)}
         let smallest_x = self.words.iter().map(|word| word.min.x).min_by(|a, b| a.total_cmp(b)).unwrap();
         let smallest_y = self.words.iter().map(|word| word.min.y).min_by(|a, b| a.total_cmp(b)).unwrap();
         return PixelPoint::new(smallest_x, smallest_y);
     }
-
+    
     pub fn get_max(&self) -> PixelPoint {
+        if self.words.is_empty() {return PixelPoint::new(0.0, 0.0)}
         let largest_x = self.words.iter().map(|word| word.max.x).max_by(|a, b| a.total_cmp(b)).unwrap();
         let largest_y = self.words.iter().map(|word| word.max.y).max_by(|a, b| a.total_cmp(b)).unwrap();
         return PixelPoint::new(largest_x, largest_y);

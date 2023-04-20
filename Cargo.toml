@@ -17,6 +17,5 @@ wgpu = "0.15"
 wgpu_glyph = "0.19.0"
 pollster = "0.2"
 screenshots = "0.5.3"
-tokio = { version = "1.27.0", features = ["rt", "rt-multi-thread"] }
 html_parser = "0.6.3"
 bytemuck = "1.13.1"
