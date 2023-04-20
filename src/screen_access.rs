@@ -1,8 +1,9 @@
-use std::{mem, thread::{JoinHandle, self}, sync::mpsc::{Sender, Receiver, self}};
+use std::{mem, thread::{self}};
 
 use bytemuck::{Pod, Zeroable};
 use chinese_dictionary::tokenize;
 use html_parser::Node;
+use tokio::{sync::{oneshot::{Receiver, self}, watch, mpsc}, task::JoinHandle};
 use wgpu::{BufferUsages, SurfaceConfiguration};
 use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
 use winit::{
@@ -69,8 +70,8 @@ struct State {
     popup_text: Option<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
     ocr_thread: JoinHandle<()>,
-    ocr_send_channel: Sender<(i32, i32, u32, u32)>,
-    ocr_receive_channel: Receiver<String>,
+    ocr_send_channel: watch::Sender<(i32, i32, u32, u32)>,
+    ocr_receive_channel: mpsc::Receiver<String>,
     ocr_text: Option<Vec<BboxLine>>,
 }
 
@@ -202,11 +203,11 @@ impl State {
         let glyph_brush = GlyphBrushBuilder::using_fonts(vec![inconsolata, simhei])
             .build(&device, surface_format);
 
-        let (main_thread_send_channel, worker_thread_receive_channel) = mpsc::channel();
-        let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel();
+        let (main_thread_send_channel, worker_thread_receive_channel) = watch::channel((0, 0, 0, 0));
+        let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel(1);
 
-        let ocr_thread = thread::spawn(move || {
-            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel);
+        let ocr_thread = tokio::spawn(async move {
+            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel).await;
         });
 
         Self {
@@ -237,6 +238,7 @@ impl State {
         }
         let window_size = self.main_window_state.window.inner_size();
         let window_inner_position = self.main_window_state.window.inner_position().unwrap();
+        println!("Sending job");
         self.ocr_send_channel.send((window_inner_position.x, window_inner_position.y, window_size.width, window_size.height)).unwrap();
     }
 
