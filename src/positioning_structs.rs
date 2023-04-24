@@ -1,10 +1,10 @@
 use std::{ops::{Sub, Add}, cmp::{min, max}};
 
 use chinese_dictionary::query_by_chinese;
-use wgpu_glyph::{ab_glyph::{self, Rect, PxScale}, Text, FontId, OwnedSection, Section, OwnedText, GlyphBrush, GlyphCruncher};
+use wgpu_glyph::{FontId, ab_glyph::{self, Rect, PxScale}, OwnedSection, Section, OwnedText, GlyphBrush, GlyphCruncher};
 use winit::dpi::{PhysicalPosition, Size, PhysicalSize};
 
-use crate::{supported_languages::SupportedLanguages, screen_access::Vertex};
+use crate::screen_access::Vertex;
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct PixelPoint {
@@ -30,7 +30,7 @@ impl PixelPoint {
 
     pub fn to_normalized_coordinate(self, screen_max_point: PixelPoint) -> [f32; 2] {
         let x = (self.x / (screen_max_point.x / 2.0)) - 1.0;
-        let y = (self.y / (screen_max_point.y / 2.0)) - 1.0;
+        let y = 1.0 - (self.y / (screen_max_point.y / 2.0));
         [x, y]
     }
 }
@@ -137,10 +137,6 @@ impl HocrWord {
         self.min
     }
 
-    pub fn get_max(&self) -> PixelPoint {
-        self.max
-    }
-
     fn get_scale(&self) -> f32 {
         self.max.y - self.min.y
     }
@@ -162,10 +158,6 @@ impl PresentableWord {
             confidence,
             is_highlighted: false
         }
-    }
-
-    pub fn get_text(&self) -> &String {
-        &self.text
     }
 
     pub fn get_min(&self) -> PixelPoint {
@@ -323,19 +315,19 @@ impl PresentableLine {
         let verticies = vec![
             Vertex { //top left
                 position: min.clone(),
-                color: [0.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0],
             },
             Vertex { //top right
                 position: [max[0], min[1]].clone(),
-                color: [0.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0],
             },
             Vertex { //bottom left
                 position: [min[0], max[1]].clone(),
-                color: [0.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0],
             },
             Vertex { //bottom right
                 position: max.clone(),
-                color: [0.0, 1.0, 1.0],
+                color: [1.0, 1.0, 1.0],
             },
         ];
         let indices = vec![

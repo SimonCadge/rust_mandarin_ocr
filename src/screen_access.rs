@@ -4,16 +4,16 @@ use abort_on_drop::ChildTask;
 use bytemuck::{Pod, Zeroable};
 use chinese_dictionary::tokenize;
 use html_parser::Node;
-use tokio::{sync::{watch, mpsc}, task::JoinHandle};
+use tokio::sync::{watch, mpsc};
 use wgpu::{BufferUsages, SurfaceConfiguration};
-use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font, FontArc}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
+use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, OwnedSection};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition},
 };
 
-use crate::{ocr, supported_languages::SupportedLanguages, positioning_structs::{PresentableLine, PixelPoint, HocrWord}};
+use crate::{ocr, positioning_structs::{PresentableLine, PixelPoint, HocrWord}};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -70,8 +70,7 @@ struct State {
     index_buffer: wgpu::Buffer,
     popup_text: Option<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
-    glyph_font: FontArc,
-    ocr_thread: ChildTask<()>,
+    _ocr_thread: ChildTask<()>,
     ocr_job_timer: Option<Instant>,
     ocr_send_channel: watch::Sender<(i32, i32, u32, u32)>,
     ocr_receive_channel: mpsc::Receiver<String>,
@@ -167,7 +166,7 @@ impl State {
             primitive: wgpu::PrimitiveState { 
                 topology: wgpu::PrimitiveTopology::TriangleList, 
                 strip_index_format: None, 
-                front_face: wgpu::FrontFace::Ccw, 
+                front_face: wgpu::FrontFace::Cw, 
                 cull_mode: Some(wgpu::Face::Back), 
                 unclipped_depth: false, 
                 polygon_mode: wgpu::PolygonMode::Fill, 
@@ -206,7 +205,7 @@ impl State {
         let (main_thread_send_channel, worker_thread_receive_channel) = watch::channel((0, 0, 0, 0));
         let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel(1);
 
-        let ocr_thread = ChildTask::from(tokio::task::spawn_blocking(|| {
+        let _ocr_thread = ChildTask::from(tokio::task::spawn_blocking(|| {
             ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel);
         }));
 
@@ -220,8 +219,7 @@ impl State {
             vertex_buffer,
             index_buffer,
             glyph_brush,
-            glyph_font: simhei.clone(),
-            ocr_thread,
+            _ocr_thread,
             ocr_job_timer: None,
             ocr_send_channel: main_thread_send_channel,
             ocr_receive_channel: main_thread_receive_channel,
@@ -284,13 +282,11 @@ impl State {
                 let screen_size = PixelPoint::new(self.main_window_state.config.width as f32, self.main_window_state.config.height as f32);
                 for line in lines {
                     let (mut line_vertices, mut line_indices) = line.generate_bounding_vertices(screen_size, offset);
-                    println!("Max: {:?}", line_vertices[3]);
                     offset += line_vertices.len() as u32;
                     vertices.append(&mut line_vertices);
                     num_indices += line_indices.len() as u32;
                     indices.append(&mut line_indices);
                 }
-                println!("Line: {:?}\n{:?}", vertices.iter().map(|vertex| vertex.position).collect::<Vec<[f32; 2]>>(), indices);
                 self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
                 self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
 
@@ -431,13 +427,13 @@ impl State {
                             words.push(word);
                         }
                     }
-                    let raw_text: String = words.iter().map(|bbox_word| bbox_word.get_text().to_string()).collect();
+                    let raw_text: String = words.iter().map(|hocr_word| hocr_word.get_text().to_string()).collect();
                     let tokenized_text = tokenize(&raw_text);
                     let mut tokenized_words = Vec::with_capacity(tokenized_text.len());
                     let mut i = 0;
                     for token in tokenized_text {
                         let first_char = token.as_bytes()[0];
-                        if let Some((index, _word)) = words.iter().map(|bbox_word| bbox_word.get_text()).enumerate().skip(i).find(|(_i, word)| word.as_bytes()[0] == first_char) {
+                        if let Some((index, _word)) = words.iter().map(|hocr_word| hocr_word.get_text()).enumerate().skip(i).find(|(_i, word)| word.as_bytes()[0] == first_char) {
                             for y in i .. index {
                                 tokenized_words.push(words[y].clone());
                             }
