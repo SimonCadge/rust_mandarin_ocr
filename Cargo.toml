@@ -16,6 +16,7 @@ log = "0.4"
 wgpu = "0.15"
 wgpu_glyph = "0.19.0"
 tokio = { version = "1.27.0", features = ["full"]}
+abort-on-drop = "0.2.2"
 screenshots = "0.5.3"
 html_parser = "0.6.3"
 bytemuck = "1.13.1"
