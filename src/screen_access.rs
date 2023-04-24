@@ -1,18 +1,19 @@
-use std::{mem, thread::{self}};
+use std::{mem, time::{Instant, Duration}};
 
+use abort_on_drop::ChildTask;
 use bytemuck::{Pod, Zeroable};
 use chinese_dictionary::tokenize;
 use html_parser::Node;
-use tokio::{sync::{oneshot::{Receiver, self}, watch, mpsc}, task::JoinHandle};
+use tokio::{sync::{watch, mpsc}, task::JoinHandle};
 use wgpu::{BufferUsages, SurfaceConfiguration};
-use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
+use wgpu_glyph::{GlyphBrush, ab_glyph::{self, Font, FontArc}, GlyphBrushBuilder, GlyphCruncher, OwnedSection};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition},
 };
 
-use crate::{ocr, supported_languages::SupportedLanguages, positioning_structs::{BboxLine, PixelPoint, BboxWord}};
+use crate::{ocr, supported_languages::SupportedLanguages, positioning_structs::{PresentableLine, PixelPoint, HocrWord}};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -69,10 +70,12 @@ struct State {
     index_buffer: wgpu::Buffer,
     popup_text: Option<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
-    ocr_thread: JoinHandle<()>,
+    glyph_font: FontArc,
+    ocr_thread: ChildTask<()>,
+    ocr_job_timer: Option<Instant>,
     ocr_send_channel: watch::Sender<(i32, i32, u32, u32)>,
     ocr_receive_channel: mpsc::Receiver<String>,
-    ocr_text: Option<Vec<BboxLine>>,
+    ocr_text: Option<Vec<PresentableLine>>,
 }
 
 impl State {
@@ -196,19 +199,16 @@ impl State {
         let simhei = ab_glyph::FontArc::try_from_slice(include_bytes!(
             "SimHei.ttf"
         )).unwrap();
-        let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
-            "Inconsolata-Regular.ttf"
-        )).unwrap();
 
-        let glyph_brush = GlyphBrushBuilder::using_fonts(vec![inconsolata, simhei])
+        let glyph_brush = GlyphBrushBuilder::using_font(simhei.clone())
             .build(&device, surface_format);
 
         let (main_thread_send_channel, worker_thread_receive_channel) = watch::channel((0, 0, 0, 0));
         let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel(1);
 
-        let ocr_thread = tokio::spawn(async move {
-            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel).await;
-        });
+        let ocr_thread = ChildTask::from(tokio::task::spawn_blocking(|| {
+            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel);
+        }));
 
         Self {
             main_window_state,
@@ -220,7 +220,9 @@ impl State {
             vertex_buffer,
             index_buffer,
             glyph_brush,
+            glyph_font: simhei.clone(),
             ocr_thread,
+            ocr_job_timer: None,
             ocr_send_channel: main_thread_send_channel,
             ocr_receive_channel: main_thread_receive_channel,
             ocr_text: None,
@@ -232,14 +234,11 @@ impl State {
         false
     }
 
-    fn update(&mut self) {
+    fn schedule_ocr_job(&mut self) {
         if self.ocr_text.is_some() {
             self.ocr_text = None;
         }
-        let window_size = self.main_window_state.window.inner_size();
-        let window_inner_position = self.main_window_state.window.inner_position().unwrap();
-        println!("Sending job");
-        self.ocr_send_channel.send((window_inner_position.x, window_inner_position.y, window_size.width, window_size.height)).unwrap();
+        self.ocr_job_timer = Instant::now().checked_add(Duration::from_millis(200));
     }
 
     fn check_running_job(&mut self) {
@@ -284,12 +283,14 @@ impl State {
                 let mut num_indices = 0;
                 let screen_size = PixelPoint::new(self.main_window_state.config.width as f32, self.main_window_state.config.height as f32);
                 for line in lines {
-                    let (mut line_vertices, mut line_indices) = line.to_vertices(screen_size, offset);
+                    let (mut line_vertices, mut line_indices) = line.generate_bounding_vertices(screen_size, offset);
+                    println!("Max: {:?}", line_vertices[3]);
                     offset += line_vertices.len() as u32;
                     vertices.append(&mut line_vertices);
                     num_indices += line_indices.len() as u32;
                     indices.append(&mut line_indices);
                 }
+                println!("Line: {:?}\n{:?}", vertices.iter().map(|vertex| vertex.position).collect::<Vec<[f32; 2]>>(), indices);
                 self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
                 self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
 
@@ -301,7 +302,7 @@ impl State {
 
         if let Some(lines) = &self.ocr_text {
             for line in lines {
-                let section = &line.to_section();
+                let section = line.get_section();
                 self.glyph_brush.queue(section);
             }
             self.glyph_brush.draw_queued(&self.device, &mut self.staging_belt, &mut encoder, &view, self.main_window_state.size.width, self.main_window_state.size.height).unwrap();
@@ -360,13 +361,7 @@ impl State {
     fn handle_cursor(&mut self, cursor_position: &PixelPoint) {
         if let Some(bbox_lines) = &mut self.ocr_text {
             for line in bbox_lines {
-                for bbox_word in line.get_mut_words() {
-                    if bbox_word.is_within_bounds(cursor_position) {
-                        bbox_word.set_highlighted(true);
-                    } else {
-                        bbox_word.set_highlighted(false);
-                    }
-                }
+                line.handle_cursor(cursor_position);
             }
             self.render_main_window().unwrap();
         }
@@ -374,27 +369,29 @@ impl State {
 
     fn handle_click(&mut self) {
         let mut something_clicked = false;
-        if let Some(bbox_lines) = &self.ocr_text {
-            for line in bbox_lines {
-                for bbox_word in line.get_words() {
-                    if bbox_word.is_highlighted() {
-                        let (text_section, bounds) = bbox_word.generate_translation_section(&mut self.glyph_brush);
-                        self.popup_text = Some(text_section);
-                        let new_size = PhysicalSize { 
-                            width: (bounds.max.x - bounds.min.x) as u32, 
-                            height: (bounds.max.y - bounds.min.y) as u32 
-                        };
-                        self.popup_window_state.resize(&self.device, new_size);
-                        self.popup_window_state.set_visible(true);
-                        let main_window_position = self.main_window_state.window.inner_position().unwrap();
-                        let popup_new_position = PhysicalPosition {
-                            x: main_window_position.x as u32 + bbox_word.get_min().get_x() as u32 - (new_size.width / 2) + ((bbox_word.get_max().get_x() - bbox_word.get_min().get_x()) as u32 / 2),
-                            y: main_window_position.y as u32 + bbox_word.get_min().get_y() as u32 - new_size.height - 10,
-                        };
-                        self.popup_window_state.window.set_outer_position(popup_new_position);
-                        self.popup_window_state.window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
-                        self.popup_window_state.window.request_redraw();
-                        something_clicked = true;
+        if let Some(lines) = &self.ocr_text {
+            for line in lines {
+                for word in line.get_words() {
+                    if word.is_highlighted() {
+                        let (text_section, bounds) = word.generate_translation_section(&mut self.glyph_brush);
+                        if let Some(bounds) = bounds {
+                            self.popup_text = Some(text_section);
+                            let new_size = PhysicalSize { 
+                                width: (bounds.max.x - bounds.min.x) as u32, 
+                                height: (bounds.max.y - bounds.min.y) as u32 
+                            };
+                            self.popup_window_state.resize(&self.device, new_size);
+                            self.popup_window_state.set_visible(true);
+                            let main_window_position = self.main_window_state.window.inner_position().unwrap();
+                            let popup_new_position = PhysicalPosition {
+                                x: main_window_position.x as u32 + word.get_min().get_x() as u32 - (new_size.width / 2) + (line.get_scale().x as u32 / 2),
+                                y: main_window_position.y as u32 + word.get_min().get_y() as u32 - new_size.height - 10,
+                            };
+                            self.popup_window_state.window.set_outer_position(popup_new_position);
+                            self.popup_window_state.window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+                            self.popup_window_state.window.request_redraw();
+                            something_clicked = true;
+                        }
                     }
                 }
             }
@@ -406,8 +403,8 @@ impl State {
         }
     }
 
-    fn nodes_to_lines(&mut self, nodes: &Vec<Node>) -> Vec<BboxLine> {
-        let mut lines: Vec<BboxLine> = Vec::new();
+    fn nodes_to_lines(&mut self, nodes: &Vec<Node>) -> Vec<PresentableLine> {
+        let mut lines: Vec<PresentableLine> = Vec::new();
         for node in nodes {
             if let html_parser::Node::Element(element) = node {
                 if element.classes.contains(&"ocr_line".to_string()) { // is individual line
@@ -418,20 +415,18 @@ impl State {
                             let title = word_element.attributes["title"].clone().unwrap();
                             let mut parts = title.split(" ");
                             parts.next();
-                            let x = parse_bbox_f32(parts.next().unwrap());
-                            let y = parse_bbox_f32(parts.next().unwrap());
+                            let x = parse_bbox_f32(parts.next().unwrap()); //Bounds reported by tesseract, unfortunately they're very inaccurate
+                            let y = parse_bbox_f32(parts.next().unwrap()); //The sizes are accurate but the positions aren't
                             let x2 = parse_bbox_f32(parts.next().unwrap());
                             let y2 = parse_bbox_f32(parts.next().unwrap());
                             parts.next();
                             let confidence = parts.next().unwrap().parse::<f32>().unwrap();
                             let text = get_text_child(&word_element.children);
-                            let word = BboxWord::new(
+                            let word = HocrWord::new(
                                 text,
                                 PixelPoint::new(x, y),
                                 PixelPoint::new(x2, y2),
-                                false,
                                 confidence,
-                                SupportedLanguages::ChiTra
                             );
                             words.push(word);
                         }
@@ -451,23 +446,10 @@ impl State {
                             tokenized_words.push(words[i+1 .. i+len].iter().fold(words[i].clone(), |lhs, rhs| lhs + rhs));
                             i += len;
                         }
+                    }if !tokenized_words.is_empty() {
+                        let line = PresentableLine::from_hocr(tokenized_words, &mut self.glyph_brush);
+                        lines.push(line);
                     }
-                    let line = BboxLine::new(tokenized_words.clone());
-                    let section = &line.to_section();
-                    let font = self.glyph_brush.fonts().to_vec();
-                    for section_glyph in self.glyph_brush.glyphs(section) {
-                        let glyph = &section_glyph.glyph;
-                        let glyph_bounds = font[section_glyph.font_id.0].glyph_bounds(glyph);
-                        let i = section_glyph.section_index;
-                        if section_glyph.byte_index == 0 {
-                            tokenized_words[i].set_min(PixelPoint::from(glyph_bounds.min));
-                            tokenized_words[i].set_max(PixelPoint::from(glyph_bounds.max));
-                        } else {
-                            tokenized_words[i].set_max(PixelPoint::from(glyph_bounds.max));
-                        }
-                    }
-                    let line = BboxLine::new(tokenized_words);
-                    lines.push(line);
                 } else { // call recursively until we reach individual words
                     lines.append(&mut self.nodes_to_lines(&node.element().unwrap().children));
                 }
@@ -584,7 +566,7 @@ pub async fn screen_entry() {
             Event::RedrawRequested(window_id) => {
                 match window_id {
                     _ if window_id == main_window_id => {
-                        window_state.update();
+                        window_state.schedule_ocr_job();
                         match window_state.render_main_window() {
                             Ok(_) => {}
                             // Reconfigure the surface if lost
@@ -612,10 +594,19 @@ pub async fn screen_entry() {
             Event::MainEventsCleared => {
                 // RedrawRequested will only trigger once, unless we manually
                 // request it.
+                if let Some(trigger_time) = window_state.ocr_job_timer {
+                    if trigger_time <= Instant::now() {
+                        window_state.ocr_job_timer = None;
+                        let window_size = window_state.main_window_state.window.inner_size();
+                        let window_inner_position = window_state.main_window_state.window.inner_position().unwrap();
+                        window_state.ocr_send_channel.send((window_inner_position.x, window_inner_position.y, window_size.width, window_size.height)).unwrap();
+                    }
+                }
                 window_state.check_running_job();
                 // state.window().request_redraw();
             }
             _ => {}
         }
     });
+    
 }

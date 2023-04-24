@@ -1,7 +1,7 @@
 use std::{ops::{Sub, Add}, cmp::{min, max}};
 
 use chinese_dictionary::query_by_chinese;
-use wgpu_glyph::{ab_glyph::{self, Rect}, Text, FontId, OwnedSection, Section, Layout, OwnedText, GlyphBrush, GlyphCruncher};
+use wgpu_glyph::{ab_glyph::{self, Rect, PxScale}, Text, FontId, OwnedSection, Section, OwnedText, GlyphBrush, GlyphCruncher};
 use winit::dpi::{PhysicalPosition, Size, PhysicalSize};
 
 use crate::{supported_languages::SupportedLanguages, screen_access::Vertex};
@@ -38,6 +38,12 @@ impl PixelPoint {
 impl From<(f32, f32)> for PixelPoint {
     fn from(pos: (f32, f32)) -> Self {
         Self { x: pos.0, y: pos.1 }
+    }
+}
+
+impl Into<(f32, f32)> for PixelPoint {
+    fn into(self) -> (f32, f32) {
+        (self.x, self.y)
     }
 }
 
@@ -92,46 +98,34 @@ impl Into<Size> for PixelArea {
     }
 }
 
-impl PixelArea {
-    pub fn new(min: PixelPoint, max: PixelPoint) -> Self {
-        Self { min, max }
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct BboxWord {
+pub struct HocrWord {
     text: String,
     min: PixelPoint,
     max: PixelPoint,
-    is_highlighted: bool,
     confidence: f32,
-    language: SupportedLanguages,
 }
 
-impl Add<&BboxWord> for BboxWord {
-    type Output = BboxWord;
+impl Add<&HocrWord> for HocrWord {
+    type Output = HocrWord;
 
-    fn add(self, rhs: &BboxWord) -> Self::Output {
-        BboxWord {
+    fn add(self, rhs: &HocrWord) -> Self::Output {
+        HocrWord {
             text: self.text + &rhs.text,
             min: min(self.min, rhs.min),
             max: max(self.max, rhs.max),
-            is_highlighted: self.is_highlighted || rhs.is_highlighted,
             confidence: self.confidence.min(rhs.confidence),
-            language: self.language,
         }
     }
 }
 
-impl BboxWord {
-    pub fn new(text: String, min: PixelPoint, max: PixelPoint, is_highlighted: bool, confidence: f32, language: SupportedLanguages) -> Self {
+impl HocrWord {
+    pub fn new(text: String, min: PixelPoint, max: PixelPoint, confidence: f32) -> Self {
         Self { 
             text,
             min,
             max,
-            is_highlighted,
             confidence,
-            language,
         }
     }
 
@@ -143,52 +137,77 @@ impl BboxWord {
         self.min
     }
 
-    pub fn set_min(&mut self, min: PixelPoint) {
-        self.min = min;
-    }
-
     pub fn get_max(&self) -> PixelPoint {
         self.max
     }
 
-    pub fn set_max(&mut self, max: PixelPoint) {
-        self.max = max;
+    fn get_scale(&self) -> f32 {
+        self.max.y - self.min.y
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PresentableWord {
+    text: String,
+    min: PixelPoint,
+    confidence: f32,
+    is_highlighted: bool,
+}
+
+impl PresentableWord {
+    pub fn new(text: String, min: PixelPoint, confidence: f32) -> Self {
+        Self { 
+            text,
+            min,
+            confidence,
+            is_highlighted: false
+        }
     }
 
-    pub fn is_within_bounds(&self, position: &PixelPoint) -> bool {
+    pub fn get_text(&self) -> &String {
+        &self.text
+    }
+
+    pub fn get_min(&self) -> PixelPoint {
+        self.min
+    }
+
+    pub fn is_within_bounds(&self, position: &PixelPoint, scale: PxScale) -> bool {
         let cursor_x: f32 = position.x as f32;
         let cursor_y: f32 = position.y as f32;
-        return cursor_x > self.min.x && cursor_x <= self.max.x
-            && cursor_y > self.min.y && cursor_y <= self.max.y;
+        return cursor_x > self.min.x && cursor_x <= self.min.x + (scale.x * self.text.chars().count() as f32)
+            && cursor_y > self.min.y && cursor_y <= self.min.y + scale.y as f32;
     }
 
     pub fn is_highlighted(&self) -> bool {
         self.is_highlighted
     }
 
-    pub fn set_highlighted(&mut self, is_highlighted: bool) {
+    pub fn set_highlighted(&mut self, is_highlighted: bool) -> bool {
+        let was_highlighted = self.is_highlighted;
         self.is_highlighted = is_highlighted;
+        return was_highlighted != is_highlighted; //return true if value has changed
     }
 
-    fn to_text(&self, scale: f32) -> Text {
-        return Text::default()
+    fn to_text(&self, scale: PxScale) -> OwnedText {
+        return OwnedText::default()
             .with_text(&self.text)
             .with_scale(scale)
             .with_color(self.get_colour())
-            .with_font_id(if self.language == SupportedLanguages::Eng {FontId(0)} else {FontId(1)});
+            .with_font_id(FontId(0));
     }
 
     fn get_colour(&self) -> [f32; 4] {
         if self.is_highlighted {
-            return [0.0, 1.0, 0.0, 1.0];
+            return [0.0, 1.0, 0.0, 1.0]; //green
         } else if self.confidence < 90.0 {
-            return [1.0, 0.0, 0.0, 1.0];
+            return [1.0, 0.0, 0.0, 1.0]; //red
         } else {
-            return [0.0, 0.0, 0.0, 1.0];
+            return [0.0, 0.0, 0.0, 1.0]; //black
         }
     }
 
-    pub fn generate_translation_section(&self, glyph_brush: &mut GlyphBrush<()>) -> (OwnedSection, Rect) {
+    pub fn generate_translation_section(&self, glyph_brush: &mut GlyphBrush<()>) -> (OwnedSection, Option<Rect>) {
         let translations = query_by_chinese(&self.text);
         let mut translations_as_string = Vec::with_capacity(translations.len());
         for translation in translations {
@@ -200,7 +219,6 @@ impl BboxWord {
             translation_as_string.push_str(&translation.english.join("\n          "));
             translation_as_string.push_str("\n");
             translations_as_string.push(OwnedText::new(&translation_as_string)
-                .with_font_id(FontId(1))
                 .with_scale(24.0));
         }
 
@@ -208,77 +226,116 @@ impl BboxWord {
             .to_owned()
             .with_text(translations_as_string);
 
-        let bounds = glyph_brush.glyph_bounds(&section).unwrap();
+        let bounds = glyph_brush.glyph_bounds(&section);
 
         (section, bounds)
     }
 }
 
-pub struct BboxLine {
-    words: Vec<BboxWord>,
+pub struct PresentableLine {
+    words: Vec<PresentableWord>,
+    section: OwnedSection,
+    min: PixelPoint,
+    max: PixelPoint,
+    scale: PxScale,
 }
 
-impl BboxLine {
-    pub fn new(words: Vec<BboxWord>) -> Self {
+impl PresentableLine {
+    pub fn from_hocr(hocr_words: Vec<HocrWord>, glyph_brush: &mut GlyphBrush<()>) -> Self {
+        let scale = PxScale::from(hocr_words.iter()
+            .filter(|word| !word.text.starts_with(|char: char| char.is_ascii_punctuation()))
+            .map(|word| word.get_scale())
+            .sum::<f32>() / hocr_words.len() as f32); //average scale of non-punctuation characters
+        let min = hocr_words[0].get_min();
+        let mut presentable_words = Vec::with_capacity(hocr_words.len());
+        let mut accumulated_text = Vec::with_capacity(hocr_words.len());
+        let mut offset = min;
+        for hocr_word in hocr_words {
+            let presentable_word = PresentableWord::new(hocr_word.text, offset, hocr_word.confidence);
+            let text = presentable_word.clone().to_text(scale);
+            presentable_words.push(presentable_word);
+            let word_bounds = glyph_brush.glyph_bounds(&OwnedSection::<()>::default().with_text(vec![text.clone()]).with_screen_position(offset)).unwrap();
+            accumulated_text.push(text);
+            offset = PixelPoint::new(word_bounds.max.x, word_bounds.min.y);
+        }
+        let section = OwnedSection::<()>::default()
+                .with_screen_position(min)
+                .with_text(accumulated_text);
+
+        let line_bounds = glyph_brush.glyph_bounds(&section).unwrap();
+        let max: PixelPoint = PixelPoint::from(line_bounds.max);
+
         return Self {
-            words,
+            words: presentable_words,
+            section,
+            min,
+            max,
+            scale,
         }
     }
 
-    pub fn get_words(&self) -> &Vec<BboxWord> {
+    pub fn get_words(&self) -> &Vec<PresentableWord> {
         &self.words
     }
-    
-    pub fn get_mut_words(&mut self) -> &mut Vec<BboxWord> {
+
+    fn get_mut_words(&mut self) -> &mut Vec<PresentableWord> {
         &mut self.words
     }
 
+    pub fn handle_cursor(&mut self, cursor_position: &PixelPoint) {
+        let scale = self.scale;
+        let mut is_changed = false;
+        for word in self.get_mut_words() {
+            if word.is_within_bounds(cursor_position, scale) {
+                is_changed = word.set_highlighted(true) || is_changed;
+            } else {
+                is_changed = word.set_highlighted(false) || is_changed;
+            }
+        }
+        if is_changed {
+            let text = self.words.iter().map(|word| word.to_text(scale)).collect();
+            self.section = OwnedSection::<()>::default()
+                .with_screen_position(self.min)
+                .with_text(text);
+        }
+    }
+
     pub fn get_min(&self) -> PixelPoint {
-        if self.words.is_empty() {return PixelPoint::new(0.0, 0.0)}
-        let smallest_x = self.words.iter().map(|word| word.min.x).min_by(|a, b| a.total_cmp(b)).unwrap();
-        let smallest_y = self.words.iter().map(|word| word.min.y).min_by(|a, b| a.total_cmp(b)).unwrap();
-        return PixelPoint::new(smallest_x, smallest_y);
+        self.min
     }
     
     pub fn get_max(&self) -> PixelPoint {
-        if self.words.is_empty() {return PixelPoint::new(0.0, 0.0)}
-        let largest_x = self.words.iter().map(|word| word.max.x).max_by(|a, b| a.total_cmp(b)).unwrap();
-        let largest_y = self.words.iter().map(|word| word.max.y).max_by(|a, b| a.total_cmp(b)).unwrap();
-        return PixelPoint::new(largest_x, largest_y);
+        self.max
     }
 
-    pub fn get_scale(&self) -> f32 {
-        return self.get_max().y - self.get_min().y;
+    pub fn get_scale(&self) -> PxScale {
+        self.scale
     }
 
-    pub fn to_section(&self) -> OwnedSection {
-        let text = self.words.iter().map(|word| word.to_text(self.get_scale())).collect();
-        return Section::default()
-            .with_screen_position((self.get_min().x, self.get_min().y))
-            .with_layout(Layout::default())
-            .with_text(text)
-            .to_owned();
+    pub fn get_section(&self) -> &OwnedSection {
+        &self.section
     }
 
-    pub fn to_vertices(&self, screen_max_point: PixelPoint, offset: u32) -> (Vec<Vertex>, Vec<u32>) {
-        let min = self.get_min();
-        let max = self.get_max();
+    pub fn generate_bounding_vertices(&self, screen_max_point: PixelPoint, offset: u32) -> (Vec<Vertex>, Vec<u32>) {
+        let min = self.get_min().to_normalized_coordinate(screen_max_point);
+        let max = self.get_max().to_normalized_coordinate(screen_max_point);
+
         let verticies = vec![
             Vertex { //top left
-                position: min.to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
+                position: min.clone(),
+                color: [0.0, 1.0, 1.0],
             },
             Vertex { //top right
-                position: PixelPoint::new(max.x, min.y).to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
+                position: [max[0], min[1]].clone(),
+                color: [0.0, 1.0, 1.0],
             },
             Vertex { //bottom left
-                position: PixelPoint::new(min.x, max.y).to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
+                position: [min[0], max[1]].clone(),
+                color: [0.0, 1.0, 1.0],
             },
             Vertex { //bottom right
-                position: max.to_normalized_coordinate(screen_max_point),
-                color: [1.0, 1.0, 1.0],
+                position: max.clone(),
+                color: [0.0, 1.0, 1.0],
             },
         ];
         let indices = vec![
