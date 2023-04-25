@@ -20,6 +20,6 @@ abort-on-drop = "0.2.2"
 screenshots = "0.5.3"
 html_parser = "0.6.3"
 bytemuck = "1.13.1"
-configparser = { version = "3.0.2", features = ["async-std"] }
+configparser = "3.0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
