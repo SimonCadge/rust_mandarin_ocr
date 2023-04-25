@@ -10,7 +10,7 @@ use tokio::{sync::{watch, mpsc}, task::yield_now};
 use crate::supported_languages::SupportedLanguages;
 
 #[tokio::main]
-pub async fn build_ocr_worker(mut receiver: watch::Receiver<(i32, i32, u32, u32)>, sender: mpsc::Sender<String>) {
+pub async fn build_ocr_worker(mut receiver: watch::Receiver<(i32, i32, u32, u32)>, sender: mpsc::Sender<String>, language: SupportedLanguages) {
     let mut window_position: Option<(i32, i32, u32, u32)> = None;
     loop {
         tokio::select! {
@@ -18,7 +18,7 @@ pub async fn build_ocr_worker(mut receiver: watch::Receiver<(i32, i32, u32, u32)
             _ = receiver.changed() => {
                 window_position = Some(*receiver.borrow());
             }
-            Ok(Some(parsed_text)) = ChildTask::from(tokio::spawn(execute_ocr(window_position))) => {
+            Ok(Some(parsed_text)) = ChildTask::from(tokio::spawn(execute_ocr(window_position, language))) => {
                 sender.send(parsed_text).await.unwrap();
                 window_position = None;
             }
@@ -27,7 +27,7 @@ pub async fn build_ocr_worker(mut receiver: watch::Receiver<(i32, i32, u32, u32)
 }
 
 
-async fn execute_ocr(t: Option<(i32, i32, u32, u32)>) -> Option<String> {
+async fn execute_ocr(t: Option<(i32, i32, u32, u32)>, language: SupportedLanguages) -> Option<String> {
     match t {
         Some((x, y, width, height)) => {
             let screen = Screen::from_point(x, y).unwrap();
@@ -37,8 +37,6 @@ async fn execute_ocr(t: Option<(i32, i32, u32, u32)>) -> Option<String> {
             yield_now().await;
 
             let image = image::load_from_memory(buffer).unwrap();
-      
-            let language = SupportedLanguages::ChiTra;
                         
             let image_width = image.width();
             let image_height = image.height();

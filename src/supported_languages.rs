@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(PartialEq, Debug, Clone, Copy)]
+use serde::{Serialize, Deserialize};
+
+#[derive(PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SupportedLanguages {
     ChiTra,
     ChiSim,

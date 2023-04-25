@@ -4,7 +4,7 @@ use chinese_dictionary::query_by_chinese;
 use wgpu_glyph::{FontId, ab_glyph::{self, Rect, PxScale}, OwnedSection, Section, OwnedText, GlyphBrush, GlyphCruncher};
 use winit::dpi::{PhysicalPosition, Size, PhysicalSize};
 
-use crate::screen_access::Vertex;
+use crate::{screen_access::Vertex, supported_languages::SupportedLanguages};
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct PixelPoint {
@@ -199,12 +199,12 @@ impl PresentableWord {
         }
     }
 
-    pub fn generate_translation_section(&self, glyph_brush: &mut GlyphBrush<()>) -> (OwnedSection, Option<Rect>) {
+    pub fn generate_translation_section(&self, glyph_brush: &mut GlyphBrush<()>, language: &SupportedLanguages) -> (OwnedSection, Option<Rect>) {
         let translations = query_by_chinese(&self.text);
         let mut translations_as_string = Vec::with_capacity(translations.len());
         for translation in translations {
             let mut translation_as_string = "".to_owned();
-            translation_as_string.push_str(&translation.traditional);
+            translation_as_string.push_str(if language == &SupportedLanguages::ChiTra {&translation.traditional} else {&translation.simplified});
             translation_as_string.push_str("(");
             translation_as_string.push_str(&translation.pinyin_marks);
             translation_as_string.push_str("): \t");

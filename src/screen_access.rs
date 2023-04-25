@@ -3,6 +3,7 @@ use std::{mem, time::{Instant, Duration}};
 use abort_on_drop::ChildTask;
 use bytemuck::{Pod, Zeroable};
 use chinese_dictionary::tokenize;
+use configparser::ini::Ini;
 use html_parser::Node;
 use tokio::sync::{watch, mpsc};
 use wgpu::{BufferUsages, SurfaceConfiguration};
@@ -10,10 +11,10 @@ use wgpu_glyph::{GlyphBrush, ab_glyph, GlyphBrushBuilder, OwnedSection};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition},
+    window::{WindowBuilder, Window}, dpi::{PhysicalSize, PhysicalPosition, Size},
 };
 
-use crate::{ocr, positioning_structs::{PresentableLine, PixelPoint, HocrWord}};
+use crate::{ocr, positioning_structs::{PresentableLine, PixelPoint, HocrWord}, supported_languages::SupportedLanguages};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -75,11 +76,13 @@ struct State {
     ocr_send_channel: watch::Sender<(i32, i32, u32, u32)>,
     ocr_receive_channel: mpsc::Receiver<String>,
     ocr_text: Option<Vec<PresentableLine>>,
+    config_parser: Ini,
+    language: SupportedLanguages,
 }
 
 impl State {
     // Creating some of the wgpu types requires async code
-    async fn new(main_window: Window, popup_window: Window) -> Self {
+    async fn new(main_window: Window, popup_window: Window, mut config_parser: Ini) -> Self {
         // The instance is a handle to our GPU
         // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -205,8 +208,13 @@ impl State {
         let (main_thread_send_channel, worker_thread_receive_channel) = watch::channel((0, 0, 0, 0));
         let (worker_thread_send_channel, main_thread_receive_channel) = mpsc::channel(1);
 
-        let _ocr_thread = ChildTask::from(tokio::task::spawn_blocking(|| {
-            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel);
+        let language = serde_json::from_str::<SupportedLanguages>(
+            &config_parser.get("other", "language").or(Some("\"ChiTra\"".to_string())).unwrap()
+        ).expect("Expected language ChiTra or ChiSim");
+        config_parser.set("other", "language", Some(serde_json::to_string(&language).unwrap()));
+        
+        let _ocr_thread = ChildTask::from(tokio::task::spawn_blocking(move || {
+            ocr::build_ocr_worker(worker_thread_receive_channel, worker_thread_send_channel, language);
         }));
 
         Self {
@@ -224,7 +232,9 @@ impl State {
             ocr_send_channel: main_thread_send_channel,
             ocr_receive_channel: main_thread_receive_channel,
             ocr_text: None,
-            popup_text: None
+            popup_text: None,
+            config_parser,
+            language
         }
     }
 
@@ -369,7 +379,7 @@ impl State {
             for line in lines {
                 for word in line.get_words() {
                     if word.is_highlighted() {
-                        let (text_section, bounds) = word.generate_translation_section(&mut self.glyph_brush);
+                        let (text_section, bounds) = word.generate_translation_section(&mut self.glyph_brush, &self.language);
                         if let Some(bounds) = bounds {
                             self.popup_text = Some(text_section);
                             let new_size = PhysicalSize { 
@@ -514,13 +524,23 @@ fn parse_bbox_f32(string: &str) -> f32 {
 
 pub async fn screen_entry() {
     env_logger::init();
+    let mut config_parser = Ini::new();
+    config_parser.load("config.ini").unwrap_or_default();
     let event_loop = EventLoop::new();
-    let main_window = WindowBuilder::new().with_transparent(true).build(&event_loop).unwrap();
+    let window_width = config_parser.getfloat("screen", "width").unwrap().or(Some(100.0)).unwrap();
+    let window_height = config_parser.getfloat("screen", "height").unwrap().or(Some(50.0)).unwrap();
+    let window_x = config_parser.getfloat("screen", "x_pos").unwrap().or(Some(100.0)).unwrap();
+    let window_y = config_parser.getfloat("screen", "y_pos").unwrap().or(Some(100.0)).unwrap();
+    let main_window = WindowBuilder::new()
+        .with_transparent(true)
+        .with_inner_size(PhysicalSize::new(window_width, window_height))
+        .with_position(PhysicalPosition::new(window_x, window_y))
+        .build(&event_loop).unwrap();
     let main_window_id = main_window.id();
     let popup_window = WindowBuilder::new().with_decorations(false).build(&event_loop).unwrap();
     let popup_window_id = popup_window.id();
 
-    let mut window_state = State::new(main_window, popup_window).await;
+    let mut window_state = State::new(main_window, popup_window, config_parser).await;
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -538,7 +558,10 @@ pub async fn screen_entry() {
                                 ..
                             },
                         ..
-                    } => *control_flow = ControlFlow::Exit,
+                    } => {
+                        window_state.config_parser.write("config.ini").unwrap();
+                        *control_flow = ControlFlow::Exit}
+                        ,
                     WindowEvent::Resized(physical_size) => {
                         window_state.main_window_state.resize(&window_state.device, *physical_size);
                     }
@@ -594,7 +617,12 @@ pub async fn screen_entry() {
                     if trigger_time <= Instant::now() {
                         window_state.ocr_job_timer = None;
                         let window_size = window_state.main_window_state.window.inner_size();
+                        window_state.config_parser.set("screen", "width", Some((window_size.width as f64).to_string()));
+                        window_state.config_parser.set("screen", "height", Some((window_size.height as f64).to_string()));
                         let window_inner_position = window_state.main_window_state.window.inner_position().unwrap();
+                        let window_outer_position = window_state.main_window_state.window.outer_position().unwrap();
+                        window_state.config_parser.set("screen", "x_pos", Some((window_outer_position.x as f64).to_string()));
+                        window_state.config_parser.set("screen", "y_pos", Some((window_outer_position.y as f64).to_string()));
                         window_state.ocr_send_channel.send((window_inner_position.x, window_inner_position.y, window_size.width, window_size.height)).unwrap();
                     }
                 }
