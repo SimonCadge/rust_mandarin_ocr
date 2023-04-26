@@ -2,7 +2,7 @@
 ### An OCR tool for learning Mandarin while playing video games
 Example:
 
-[Example Video](decky_translate_demo.webm)
+[Example Video](decky_translate_demo.webm.mov)
 
 This is an attempt to recreate the wonderful OCR functionality in the Pleco Android app (and probably also in the iOS app) in a way that I can use it on my Steam Deck.
 
