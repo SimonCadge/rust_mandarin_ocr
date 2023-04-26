@@ -1,4 +1,4 @@
-# Decky Translate
+# Rust Mandarin OCR
 ### An OCR tool for learning Mandarin while playing video games
 Example:
 
@@ -14,4 +14,4 @@ The app will remember its size and position, so in a game such as Pokemon where 
 
 Currently only Mandarin is supported, you can choose between Traditional and Simplified by adding **language="ChiTra"** or **language="ChiSim"** to the **[other]** section of the config.ini file.
 
-Next step is to determine how to get this onto a steam deck, preferably as a decky plugin as the name implies. That being said it does work on Linux perfectly well, and would probably work on Windows too, so I might make that a stretch goal after getting the decky part working.
+Initially the plan was to load this as a steam deck plugin using Decky Loader. Having looked at the decky plugin structure it seems the plugin would need to be written in python and typescript, and it isn't clear whether things like drawing to the screen during gameplay would be possible, so I think I'll make that a separate project.
